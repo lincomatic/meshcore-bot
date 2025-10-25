@@ -27,6 +27,7 @@ class CommandManager:
         self.custom_syntax = self.load_custom_syntax()
         self.banned_users = self.load_banned_users()
         self.monitor_channels = self.load_monitor_channels()
+        self.logger.info(f"Monitoring channels: {self.monitor_channels}")
         
         # Initialize plugin loader and load all plugins
         self.plugin_loader = PluginLoader(bot)
