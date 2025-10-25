@@ -125,6 +125,7 @@ class MeshCoreBot:
 # Connection type: serial or ble
 # serial: Connect via USB serial port
 # ble: Connect via Bluetooth Low Energy
+# tcp: Connect via TCP/IP
 connection_type = serial
 
 # Serial port (for serial connection)
@@ -134,6 +135,11 @@ serial_port = /dev/ttyUSB0
 # BLE device name (for BLE connection)
 # Leave commented out for auto-detection, or specify exact device name
 #ble_device_name = MeshCore
+
+# TCP hostname or IP number
+#hostname = 192.168.1.60
+# TCP port
+#tcp_port = 5000
 
 # Connection timeout in seconds
 timeout = 30
@@ -503,6 +509,12 @@ use_zulu_time = false
                 serial_port = self.config.get('Connection', 'serial_port', fallback='/dev/ttyUSB0')
                 self.logger.info(f"Connecting via serial port: {serial_port}")
                 self.meshcore = await meshcore.MeshCore.create_serial(serial_port, debug=False)
+            elif connection_type == 'tcp':
+                # tcp
+                hostname = self.config.get('Connection', 'hostname', fallback=None)
+                port = self.config.get('Connection', 'tcp_port', fallback=5000)
+                self.logger.info(f"Connecting via TCP: {hostname}:{port}")
+                self.meshcore = await meshcore.MeshCore.create_tcp(hostname, port, debug=True)
             else:
                 # Create BLE connection (default)
                 ble_device_name = self.config.get('Connection', 'ble_device_name', fallback=None)
