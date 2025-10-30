@@ -466,40 +466,41 @@ class WxCommand(BaseCommand):
             if wind_gusts and len(weather) < 140:
                 weather += f" 💨{wind_gusts}"
             
-            # Add tomorrow with high/low if available
+            # Add next with high/low if available
             if len(forecast) > 1:
-                tomorrow = forecast[1]
-                tomorrow_temp = tomorrow.get('temperature', '')
-                tomorrow_short = tomorrow.get('shortForecast', '')
-                tomorrow_detailed = tomorrow.get('detailedForecast', '')
-                tomorrow_wind_speed = tomorrow.get('windSpeed', '')
-                tomorrow_wind_direction = tomorrow.get('windDirection', '')
+                next = forecast[1]
+                next_name = next.get('name','Next')
+                next_temp = next.get('temperature', '')
+                next_short = next.get('shortForecast', '')
+                next_detailed = next.get('detailedForecast', '')
+                next_wind_speed = next.get('windSpeed', '')
+                next_wind_direction = next.get('windDirection', '')
                 
-                if tomorrow_temp and tomorrow_short:
-                    # Try to get high/low for tomorrow
-                    tomorrow_high_low = self.extract_high_low(tomorrow_detailed)
+                if next_temp and next_short:
+                    # Try to get high/low for next
+                    next_high_low = self.extract_high_low(next_detailed)
                     
-                    tomorrow_emoji = self.get_weather_emoji(tomorrow_short)
-                    if tomorrow_high_low:
-                        tomorrow_str = f" | Tmrw: {tomorrow_emoji}{tomorrow_short} {tomorrow_high_low}"
+                    next_emoji = self.get_weather_emoji(next_short)
+                    if next_high_low:
+                        next_str = f" | {next_name}: {next_emoji}{next_short} {next_high_low}"
                     else:
-                        tomorrow_str = f" | Tmrw: {tomorrow_emoji}{tomorrow_short} {tomorrow_temp}°"
+                        next_str = f" | {next_name}: {next_emoji}{next_short} {next_temp}°"
                     
-                    # Add tomorrow wind info if space allows
-                    if tomorrow_wind_speed and tomorrow_wind_direction and len(weather + tomorrow_str) < 120:
+                    # Add next wind info if space allows
+                    if next_wind_speed and next_wind_direction and len(weather + next_str) < 120:
                         import re
-                        wind_match = re.search(r'(\d+)', tomorrow_wind_speed)
+                        wind_match = re.search(r'(\d+)', next_wind_speed)
                         if wind_match:
                             wind_num = wind_match.group(1)
-                            wind_dir = self.abbreviate_wind_direction(tomorrow_wind_direction)
+                            wind_dir = self.abbreviate_wind_direction(next_wind_direction)
                             if wind_dir:
                                 wind_info = f" {wind_dir}{wind_num}"
-                                if len(weather + tomorrow_str + wind_info) <= 130:
-                                    tomorrow_str += wind_info
+                                if len(weather + next_str + wind_info) <= 130:
+                                    next_str += wind_info
                     
                     # Only add if we have space
-                    if len(weather + tomorrow_str) <= 130:  # Leave room for alerts
-                        weather += tomorrow_str
+                    if len(weather + next_str) <= 130:  # Leave room for alerts
+                        weather += next_str
             
             return weather, weather_json
             
