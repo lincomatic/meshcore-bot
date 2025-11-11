@@ -145,11 +145,12 @@ class BaseCommand(ABC):
                 routing_info = parts[0]
         
         # Add SNR and RSSI
-        snr_info = f"SNR: {message.snr or 'Unknown'} dB"
-        rssi_info = f"RSSI: {message.rssi or 'Unknown'} dBm"
+###        snr_info = f"SNR: {message.snr or 'Unknown'} dB"
+###        rssi_info = f"RSSI: {message.rssi or 'Unknown'} dBm"
         
         # Build enhanced connection info
-        connection_info = f"{routing_info} | {snr_info} | {rssi_info}"
+###        connection_info = f"{routing_info} | {snr_info} | {rssi_info}"
+        connection_info = f"{routing_info}"
         
         return connection_info
     
