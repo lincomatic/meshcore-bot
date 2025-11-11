@@ -166,17 +166,30 @@ class BaseCommand(ABC):
         else:
             return "Unknown"
     
+    def format_elapsed(self, message: MeshMessage) -> str:
+        """Format message timestamp for display"""
+        if message.timestamp and message.timestamp != 'unknown':
+            try:
+                from datetime import datetime,UTC
+                el = round((datetime.now(UTC).timestamp()-message.timestamp)*1000)
+                return f"{el}ms"
+            except:
+                return str(message.timestamp)
+        else:
+            return "Unknown"
+
     def format_response(self, message: MeshMessage, response_format: str) -> str:
         """Format a response string with message data"""
         try:
             connection_info = self.build_enhanced_connection_info(message)
             timestamp = self.format_timestamp(message)
-            
+            elapsed = self.format_elapsed(message)
             return response_format.format(
                 sender=message.sender_id or "Unknown",
                 connection_info=connection_info,
                 path=message.path or "Unknown",
                 timestamp=timestamp,
+                elapsed=elapsed,
                 snr=message.snr or "Unknown",
                 rssi=message.rssi or "Unknown"
             )

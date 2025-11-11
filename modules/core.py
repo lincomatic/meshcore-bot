@@ -261,7 +261,7 @@ admin_commands = repeater
 # {snr}: Signal-to-noise ratio in dB
 # {timestamp}: Message timestamp in HH:MM:SS format
 # {path}: Message routing path (e.g., "01,5f (2 hops)")
-test = "ack {sender}{phrase_part} | {connection_info} | Received at: {timestamp}"
+test = "ack {sender}{phrase_part} | {connection_info} | Recv at: {timestamp}"
 ping = "Pong!"
 pong = "Ping!"
 help = "Bot Help: test, ping, help, hello, cmd, advert, t phrase, @string, wx, aqi, sun, moon, solar, hfcond, satpass | Use 'help <command>' for details"

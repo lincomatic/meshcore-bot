@@ -1231,7 +1231,7 @@ class MessageHandler:
                             path_string = ','.join(path_nodes)
                             self.logger.info(f"🎯 EXTRACTED PATH FROM TRACE PACKET: {path_string} ({hops} hops)")
                         else:
-                            path_string = "Direct" if hops == 0 else f"Unknown routing ({hops} hops)"
+                            path_string = "Direct" if hops == 0 else f"Unknown route ({hops} hops)"
                             self.logger.info(f"🎯 EXTRACTED PATH FROM TRACE PACKET: {path_string}")
                     else:
                         # For all other packet types, try multiple methods to get the path
@@ -1258,7 +1258,7 @@ class MessageHandler:
                                     self.logger.info(f"🎯 EXTRACTED PATH FROM PATH_INFO: {path_string} ({hops} hops)")
                                 else:
                                     # No path found - this is truly unknown
-                                    path_string = "Direct" if hops == 0 else "Unknown routing"
+                                    path_string = "Direct" if hops == 0 else "Unknown route"
                                     self.logger.info(f"🎯 EXTRACTED PATH FROM PACKET: {path_string} ({hops} hops)")
                 else:
                     # Packet decoding failed - try to extract path directly from raw hex

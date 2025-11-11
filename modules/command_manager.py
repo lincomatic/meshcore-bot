@@ -141,13 +141,16 @@ class CommandManager:
                     # Format timestamp
                     if message.timestamp and message.timestamp != 'unknown':
                         try:
-                            from datetime import datetime
+                            from datetime import datetime,UTC
                             dt = datetime.fromtimestamp(message.timestamp)
                             time_str = dt.strftime("%H:%M:%S")
+                            elapsed_str = round((datetime.now(UTC).timestamp()-message.timestamp)*1000)
                         except:
                             time_str = str(message.timestamp)
+                            elapsed_str = "Unknown"
                     else:
                         time_str = "Unknown"
+                        elapsed_str = "Unknown"
                     
                     # Format the response with available message data
                     response = response_format.format(
@@ -156,7 +159,8 @@ class CommandManager:
                         path=message.path or "Unknown",
                         timestamp=time_str,
                         snr=message.snr or "Unknown",
-                        rssi=message.rssi or "Unknown"
+                        rssi=message.rssi or "Unknown",
+                        elapsed=elapsed_str or "Unknown"
                     )
                     matches.append((keyword, response))
                 except (KeyError, ValueError) as e:

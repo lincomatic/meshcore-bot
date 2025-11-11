@@ -86,6 +86,7 @@ class TestCommand(BaseCommand):
         try:
             connection_info = self.build_enhanced_connection_info(message)
             timestamp = self.format_timestamp(message)
+            elapsed = self.format_elapsed(message)
             
             # Format phrase part - add colon and space if phrase exists
             phrase_part = f": {phrase}" if phrase else ""
@@ -97,6 +98,7 @@ class TestCommand(BaseCommand):
                 connection_info=connection_info,
                 path=message.path or "Unknown",
                 timestamp=timestamp,
+                elapsed=elapsed,
                 snr=message.snr or "Unknown"
             )
         except (KeyError, ValueError) as e:
