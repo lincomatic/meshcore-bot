@@ -145,12 +145,11 @@ class BaseCommand(ABC):
                 routing_info = parts[0]
         
         # Add SNR and RSSI
-###        snr_info = f"SNR: {message.snr or 'Unknown'} dB"
-###        rssi_info = f"RSSI: {message.rssi or 'Unknown'} dBm"
+        snr_info = f"SNR: {message.snr or 'Unknown'} dB"
+        rssi_info = f"RSSI: {message.rssi or 'Unknown'} dBm"
         
         # Build enhanced connection info
-###        connection_info = f"{routing_info} | {snr_info} | {rssi_info}"
-        connection_info = f"{routing_info}"
+        connection_info = f"{routing_info} | {snr_info} | {rssi_info}"
         
         return connection_info
     
@@ -165,25 +164,25 @@ class BaseCommand(ABC):
                 return str(message.timestamp)
         else:
             return "Unknown"
-    
+
     def format_elapsed(self, message: MeshMessage) -> str:
         """Format message timestamp for display"""
         if message.timestamp and message.timestamp != 'unknown':
             try:
-                from datetime import datetime,UTC
-                el = round((datetime.now(UTC).timestamp()-message.timestamp)*1000)
-                return f"{el}ms"
+                from datetime import datetime
+                return time.time()-message.timestamp
             except:
                 return str(message.timestamp)
         else:
             return "Unknown"
-
+        
     def format_response(self, message: MeshMessage, response_format: str) -> str:
         """Format a response string with message data"""
         try:
             connection_info = self.build_enhanced_connection_info(message)
             timestamp = self.format_timestamp(message)
             elapsed = self.format_elapsed(message)
+            
             return response_format.format(
                 sender=message.sender_id or "Unknown",
                 connection_info=connection_info,

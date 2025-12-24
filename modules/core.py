@@ -508,18 +508,19 @@ use_zulu_time = false
                 # Create serial connection
                 serial_port = self.config.get('Connection', 'serial_port', fallback='/dev/ttyUSB0')
                 self.logger.info(f"Connecting via serial port: {serial_port}")
+#                self.meshcore = await meshcore.MeshCore.create_serial(serial_port, debug=False, auto_reconnect=True, max_reconnect_attempts=10)
                 self.meshcore = await meshcore.MeshCore.create_serial(serial_port, debug=False)
             elif connection_type == 'tcp':
                 # tcp
                 hostname = self.config.get('Connection', 'hostname', fallback=None)
                 port = self.config.get('Connection', 'tcp_port', fallback=5000)
                 self.logger.info(f"Connecting via TCP: {hostname}:{port}")
-                self.meshcore = await meshcore.MeshCore.create_tcp(hostname, port, debug=True)
+                self.meshcore = await meshcore.MeshCore.create_tcp(hostname, port, debug=True, auto_reconnect=True, max_reconnect_attempts=10)
             else:
                 # Create BLE connection (default)
                 ble_device_name = self.config.get('Connection', 'ble_device_name', fallback=None)
                 self.logger.info(f"Connecting via BLE" + (f" to device: {ble_device_name}" if ble_device_name else ""))
-                self.meshcore = await meshcore.MeshCore.create_ble(device_name=ble_device_name, debug=False)
+                self.meshcore = await meshcore.MeshCore.create_ble(device_name=ble_device_name, debug=False,auto_reconnect=True, max_reconnect_attempts=10)
             
             if self.meshcore.is_connected:
                 self.connected = True
