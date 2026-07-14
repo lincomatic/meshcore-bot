@@ -35,9 +35,37 @@ reconnect_delay_seconds = 5
 # Maximum delay in seconds between reconnect attempts (cap on exponential backoff)
 reconnect_max_delay_seconds = 60
 
+# Enable verbose meshcore protocol logging (set true only when debugging)
+radio_debug = false
+
+# Radio health probe interval in seconds (clamped to 300-900)
+radio_probe_interval_seconds = 300
+
+# Consecutive failed probes before zombie state is declared
+radio_probe_fail_threshold = 3
+
+# Send immediate zombie alert email (uses Notifications SMTP settings)
+radio_zombie_alert_enabled = false
+
+# Optional zombie alert recipients (comma-separated; empty = nightly recipients)
+radio_zombie_alert_email =
+
+# Consecutive send timeouts before entering radio-offline state
+radio_offline_threshold = 3
+
+# Send immediate radio-offline alert email (uses Notifications SMTP settings)
+radio_offline_alert_enabled = false
+
+# Optional radio-offline alert recipients (comma-separated; empty = nightly recipients)
+radio_offline_alert_email =
+
 [Bot]
 # Bot name for identification and logging
 bot_name = MeshCoreBot
+
+# Uncomment ONLY if you intentionally want to run this bot on the shared Public channel.
+# Running a bot on Public is potentially disruptive to other mesh users.
+# i_understand_that_running_the_bot_on_the_public_channel_is_potentially_disruptive_to_other_users_enjoyment_of_the_mesh_and_i_would_like_to_do_it_anyway = true
 
 # Automatically update device name to match bot_name on startup
 # true: Device name will be updated to match bot_name if they differ (default)
@@ -61,7 +89,17 @@ node_id =
 # If set, all commands must start with this prefix (e.g., "!", ".", "b", "abc")
 # Examples: "!" for !ping, "." for .ping, "b" for bping, "abc" for abcping
 # Leave empty or unset to allow commands without prefix (backward compatible)
-#command_prefix = 
+#command_prefix =
+
+# Respond to channel messages when the bot is mentioned via @[bot_name]
+# Controls how the bot handles @[bot_name] mentions in channel messages:
+#   also   - Default. Mention is stripped when present, but commands also work without a mention.
+#            Lets "@[BotName] ping" and "ping" both work.
+#   only   - Bot only responds to channel messages that include @[bot_name].
+#            Messages without a mention are silently ignored.
+#   false  - Mentions not handled; bot responds to all matching commands as before.
+# DMs are always processed normally regardless of this setting.
+respond_to_mentions = also
 
 # Enable/disable bot responses
 # true: Bot will respond to keywords and commands
@@ -77,6 +115,12 @@ passive_mode = false
 # Prevents spam by limiting how often the bot can send messages
 rate_limit_seconds = 10
 
+# Spread [Scheduled_Messages] jobs that fire at the same wall time over [0, N) seconds
+# (deterministic from the cron key) so they still air cleanly under bot_tx_rate_limit.
+# Set to 0 to disable stagger only. Scheduled sends skip global rate_limit_seconds;
+# per-channel limits and bot_tx_rate_limit_seconds still apply.
+scheduled_message_max_stagger_seconds = 1.5
+
 # Bot transmission rate limit in seconds between bot messages
 # Prevents bot from overwhelming the mesh network
 bot_tx_rate_limit_seconds = 1.0
@@ -84,7 +128,7 @@ bot_tx_rate_limit_seconds = 1.0
 # Per-user rate limit: minimum seconds between bot replies to the same user
 # User is identified by public key when available (DMs and channel when provided), else sender name
 # Channel senders are often matched by name only. Set to 0 or disable to effectively turn off per-user limiting
-per_user_rate_limit_seconds = 5
+per_user_rate_limit_seconds = 30
 # Enable or disable per-user rate limiting (true/false)
 per_user_rate_limit_enabled = true
 
@@ -140,6 +184,15 @@ startup_advert = false
 # false: Manual mode - no automatic actions, use !repeater commands to manage contacts (default)
 auto_manage_contacts = bot
 
+# When auto_manage_contacts = device, the bot schedules one-shot jobs after connect:
+#   - Firmware: manual per-type contact adds + overwrite oldest non-favourite on full + auto-add chat (companions) only (bitmask 0x03)
+#   - Favourite hygiene: Admin_ACL and announcements ACL pubkeys are favourited on the radio; other favourites are cleared so eviction can recycle slots
+# Delays (seconds) before each step so the radio is not flooded at boot (defaults shown)
+#device_mode_firmware_delay_seconds = 30
+#device_mode_favourite_pass1_delay_seconds = 90
+#device_mode_favourite_pass2_delay_seconds = 180
+#contact_flag_update_spacing_ms = 200
+
 # Database path for main bot database
 # Default: meshcore_bot.db
 db_path = meshcore_bot.db
@@ -152,6 +205,16 @@ db_path = meshcore_bot.db
 
 # Seconds to wait after a failed service restart before retrying (default: 300)
 service_restart_backoff_seconds = 300
+
+# Max seconds to wait for a channel message send before timing out (default: 30)
+send_timeout_seconds = 30
+
+[Admin]
+# Local admin API (binds to 127.0.0.1)
+enabled = false
+port = 5001
+# Required when enabled
+token =
 
 [Channels]
 # Channels to monitor (comma-separated)
@@ -179,7 +242,7 @@ respond_to_dms = true
 # Messages received with a high number of hops are rarely intended for the local
 # mesh and are not likely to get recieve a response.
 # Default: 64 - to not change behavior on existing installations
-max_response_hops = 10
+max_response_hops = 7
 
 # Set a custom prefix length for the public keys to identify repeaters
 # 1 = 2 hex chars (e.g. 7E), 2 = 4 hex chars (e.g. 7E42). Also used as the mesh
@@ -187,11 +250,20 @@ max_response_hops = 10
 # conflating distinct links (see Path Command / path-command-config.md).
 prefix_bytes = 1
 
-# Flood scope for channel messages (MeshCore regions; optional)
-# Empty, * or 0: classic flood (default). Set to a region name (e.g. west) to limit
-# channel sends to that scope. Dynamic "reply with same scope as sender" is not
-# supported until the protocol exposes scope on received channel messages.
-# flood_scope =
+# List of region scopes (comma-separated) that the bot will reply to when messages arrive on those scopes.
+# Replies mirror scope via RF correlation (TC_FLOOD / GRP_TXT); stale ADVERT/other packets are not used for scope.
+# Responses will be sent with the same scope hash when correlation succeeds.
+# Example: flood_scopes = *,#west,#east
+# Use * to allow replies to unscoped FLOOD messages.
+# Leave blank or commented to use the default (all).
+# flood_scopes = #region, #otherregion
+
+# Outgoing flood scope override (optional)
+# Fixed scope for proactive sends and when reply_scope is unset (webhooks, scheduled messages).
+# Replies with matched reply_scope still use that scope; this does not override per-message mirror.
+# Leave commented or empty to rely on auto-mirror from flood_scopes correlation only.
+# You can use "region" or "#region" (the # is added if missing).
+# outgoing_flood_scope_override = #west
 
 [Banned_Users]
 # List of banned sender names (comma-separated). Matching is prefix (starts-with):
@@ -258,6 +330,7 @@ admin_commands = repeater,webviewer,reload,channelpause
 # Enable companion contact purging
 # true: Purge inactive companions when contact list is full
 # false: Never purge companions (default: false for safety)
+# When [Bot] auto_manage_contacts=device, companion auto-purge from the radio is always skipped (firmware slot policy).
 companion_purge_enabled = false
 
 # Days since last DM to consider companion inactive
@@ -327,10 +400,10 @@ test = "ack @[{sender}]{phrase_part} | {connection_info} | Received at: {timesta
 ping = "Pong!"
 pong = "Ping!"
 # Override 'help' command output
-# help = "Bot Help: test (or t), ping, help, hello, cmd, advert, wx, aqi, sun, moon, solar, hfcond, satpass, prefix, path, sports, dice, roll, stats | More: 'help <command>'"
+# help = "Bot Help: test (or t), ping, version, help, hello, cmd, advert, wx, aqi, sun, moon, solar, hfcond, satpass, prefix, path, sports, dice, roll, stats | More: 'help <command>'"
 
 # Override 'cmd' command output
-# cmd = "Available commands: test (or t), ping, help, hello, cmd, advert, wx, aqi, sun, moon, solar, hfcond, satpass, prefix, path, sports, dice, roll, stats"
+# cmd = "Available commands: test (or t), ping, version, help, hello, cmd, advert, wx, aqi, sun, moon, solar, hfcond, satpass, prefix, path, sports, dice, roll, stats"
 
 [RandomLine]
 # Configurable command to act on a trigger word and respond with a random line from its file
@@ -338,6 +411,7 @@ pong = "Ping!"
 # file.<key> = path to text file
 # prefix.<key> = string prepended to the chosen line (often an emoji)
 # channel.<key> or channels.<key> = comma-separated channel names; if set, trigger only works in those channels (e.g. channel.momjoke = #jokes)
+# category.<key> = command reference category for website generation (default: fun/Fun Commands)
 
 # default prefix (blank = no prefix)
 prefix.default =
@@ -347,17 +421,37 @@ triggers.momjoke = momjoke,momjokes,mom joke,mom jokes,mom-joke,mom-jokes
 file.momjoke = data/randomlines/momjokes.txt
 prefix.momjoke = 🥸
 # channel.momjoke = #jokes
+# category.momjoke = fun
 
 # Fun Facts
 triggers.funfact = funfact,funfacts,fun fact,fun facts,fun-fact,fun-facts
 file.funfact = data/randomlines/funfacts.txt
 prefix.funfact = 💡
+category.funfact = fun
+
+# Example: fortunes via RandomLine
+#triggers.fortune = fortune,fortunes
+#file.fortune = data/randomlines/fortunes.txt
+#prefix.fortune = 🥠
+#category.fortune = fun
 
 [Scheduled_Messages]
-# Scheduled message format: HHMM = channel:message
-# Time format: HHMM (24-hour, no colon)
-# Bot will send these messages at the specified times daily
-# Example: 0800 = general:Good morning! Weather update coming soon.
+# Scheduled message format:
+#   <schedule> = channel:message
+#   <schedule> = channel:#flood_scope:message   (regional flood — middle field must start with #)
+# The scoped form uses split(':', 2): the message body may contain additional colons.
+# Examples:
+#   0 18 * * * = Public:Hello! ...
+#   0 18 * * * = Public:#sea:Hello! ...   (same channel text, sent with #sea flood scope)
+#
+# <schedule> is one of:
+#   - 5-field crontab (minute hour day-of-month month day-of-week), e.g.
+#       0 8 * * *     = every day at 08:00 (in [Bot] timezone)
+#       30 12 * * 1   = every Monday at 12:30
+#   - Preset aliases (same semantics as common cron @macros):
+#       @yearly @annually  @monthly  @weekly  @daily  @midnight  @hourly
+#   - Deprecated (still accepted, logs a warning): HHMM = daily at that 24h clock time
+#       0800          = same as 0 8 * * *   — migrate to cron; HHMM will be removed later.
 #
 # Newlines: use \n in the message for a line break (e.g. general:Line one\nLine two).
 # Literal backslash: use \\n for backslash+n; \\t for tab.
@@ -391,14 +485,15 @@ prefix.funfact = 💡
 # {repeaters} - Same as {total_repeaters}
 # {companions} - Same as {total_companions}
 # 
-# Example with placeholders:
-# 0800 = Public:Good morning! Network: {total_contacts} total ({total_repeaters} repeaters, {total_companions} companions). {new_repeaters_7d} new repeaters, {new_companions_7d} new companions in last 7d. {recent_activity_24h} active in 24h.
+# Example with placeholders (cron):
+# 0 8 * * * = Public:Good morning! Network: {total_contacts} total ({total_repeaters} repeaters, {total_companions} companions). {new_repeaters_7d} new repeaters, {new_companions_7d} new companions in last 7d. {recent_activity_24h} active in 24h.
 # Example with 30-day active devices and new devices in 7d:
-# 0900 = Public:{total_contacts_30d} active in last 30d: ({total_repeaters_30d} repeaters, {total_companions_30d} companions). {new_repeaters_7d} new repeaters, {new_companions_7d} new companions in last 7d. {recent_activity_24h} users active in last 24h.
+# 0 9 * * * = Public:{total_contacts_30d} active in last 30d: ({total_repeaters_30d} repeaters, {total_companions_30d} companions). {new_repeaters_7d} new repeaters, {new_companions_7d} new companions in last 7d. {recent_activity_24h} users active in last 24h.
 
-#0800 = Public:Good morning! Bot is online and ready.
-#1200 = Public:Midday status check - all systems operational.
-#1800 = Public:Evening update - bot status: Good
+#0 8 * * * = Public:Good morning! Bot is online and ready.
+#0 12 * * * = Public:Midday status check - all systems operational.
+#0 18 * * * = Public:Evening update - bot status: Good
+# @hourly = Public:Hourly ping (preset example; comment out if unused)
 
 [Schedule_Command]
 # Show scheduled messages and advert interval via the 'schedule' command
@@ -581,6 +676,10 @@ weather_provider = noaa
 # Supported model names: https://open-meteo.com/en/docs
 # Set to an empty value (weather_model =) to omit model selection and let Open-Meteo auto-select
 #weather_model =
+
+# Default city name for empty "wx" / "gwx" commands when companion location is unavailable
+# Use English city names (examples: Seattle or Seattle, WA)
+#default_city =
 
 # Default state for city name disambiguation
 # When users type "wx seattle", it will search for "seattle, WA, USA"
@@ -777,10 +876,31 @@ mesh_connections_retention_days = 7
 # Enable or disable the path command
 enabled = true
 
+# Require minimum path byte length before responding to this command
+# 0 = allow all (default)
+# 1 = allow all (compatibility alias for 0)
+# 2 = only respond when path has 2 bytes or more (e.g. 0101...)
+# 3 = only respond when path is exactly 3 bytes (e.g. 010101)
+require_path_bytes_greater_or_equal_to = 0
+# Optional response when rejected by path-byte requirement; leave empty for silent reject
+require_path_bytes_failure_response =
+
 # Enable "p" shortcut for path command (similar to "t" for test command)
 # true: Respond to just "p" or "p <path_data>" as a shortcut for "path"  (default)
 # false: Only respond to "path", "decode", or "route" keywords
 enable_p_shortcut = true
+
+# Optional first line prepended to path command RF replies (Python str.format on the triggering message).
+# Placeholders match Multitest/Keywords-style responses: {sender}, {connection_info}, {path},
+# {timestamp}, {snr}, {rssi}. Only the first RF chunk includes the prefix when the reply is split.
+# Example: @[{sender}]
+reply_prefix =
+
+# Bytes per hop required before resolving repeater names from the database.
+# 0 or 1: always resolve names (default). 2: require 2-byte (or wider) hops. 3: require 3-byte hops.
+# If the packet path is shorter, the bot still responds with Path: … (hex) plus a short tip (no lookup).
+# Independent of require_path_bytes_greater_or_equal_to above, which can reject the command entirely.
+minimum_path_bytes = 0
 
 # Path Selection Preset
 # Choose a preset that configures multiple related settings:
@@ -1019,8 +1139,16 @@ enabled = false
 # Leave empty to use default format
 # Example: "Found {path_count} unique path(s) for @[{sender}]:\n{paths}"
 response_format = @[{sender}] found {path_count} unique path(s):\n{paths}
-# When true, {paths} uses shared-prefix lines ending with ┐ U+2510 when branching, then ├ U+251C / └ U+2514 (nested rows use 　 U+3000 before ├/└)
-condense_paths = false
+# condense_paths: false = one full path per line; true = flat condensed tree (default); nested = indented ├/└ under ┐ sub-blocks (uses ASCII spaces, not U+2502, to save bytes vs old │).
+condense_paths = true
+# Require minimum path byte length for triggering and collected packets
+# 0 = allow all (default)
+# 1 = allow all (compatibility alias for 0)
+# 2 = only include paths with 2 bytes or more (e.g. 0101...)
+# 3 = only include paths with exactly 3 bytes (e.g. 010101)
+require_path_bytes_greater_or_equal_to = 0
+# Optional response when rejected by path-byte requirement; leave empty for silent reject
+require_path_bytes_failure_response =
 
 [Greeter_Command]
 # Enable greeter to greet users on first channel message (true/false)
@@ -1154,9 +1282,8 @@ api_url = http://api.airplanes.live/v2/
 # Maximum: 250 nautical miles
 default_radius = 25
 
-# Maximum number of aircraft to return in results
-# Maximum: 50
-max_results = 10
+# Maximum number of aircraft to return in default list results (range: 1-10)
+max_results = 3
 
 # API request timeout in seconds
 url_timeout = 10
@@ -1199,6 +1326,10 @@ enabled = true
 enabled = true
 # channels =
 
+[Version_Command]
+enabled = true
+# channels =
+
 [Moon_Command]
 enabled = true
 # channels =
@@ -1225,6 +1356,8 @@ enabled = true
 
 [Cmd_Command]
 enabled = true
+# Optional: override `cmd` output with a link to your full docs page
+# cmd_reference_url = https://example.com/command-reference
 # channels =
 
 [Channels_Command]
@@ -1245,6 +1378,21 @@ enabled = true
 
 [Test_Command]
 enabled = true
+# Require minimum path byte length before responding to test/t
+# 0 = allow all (default)
+# 1 = allow all (compatibility alias for 0)
+# 2 = only respond when path has 2 bytes or more (e.g. 0101...)
+# 3 = only respond when path is exactly 3 bytes (e.g. 010101)
+require_path_bytes_greater_or_equal_to = 0
+# Optional response when rejected by path-byte requirement; leave empty for silent reject
+require_path_bytes_failure_response =
+
+# Optional: full ack template for test/t. When set, overrides [Keywords] test for this command only.
+# Same placeholders as Keywords (sender, phrase, phrase_part, connection_info, path, hops, hops_label,
+# timestamp, elapsed, snr, path_distance, firstlast_distance).
+# Pipe filters (feed-style), e.g. only show cumulative path distance when hops are multibyte (2+ bytes per hop):
+# response_format = ack @[{sender}]{phrase_part} | {connection_info}{path_distance|pathbytes_min:2|prefix_if_nonempty: | Path Dist: }| F/L Dist: {firstlast_distance} | {elapsed} | Rec: {timestamp}
+# Filters: pathbytes_min:N (alias pathbytes:N) clears the field unless bytes_per_hop >= N; prefix_if_nonempty:L prepends literal L when value non-empty after prior filters. If L contains |, put prefix_if_nonempty last in that placeholder (it consumes the rest of the chain as its literal).
 # channels =
 
 [Trace_Command]
@@ -1274,6 +1422,8 @@ update_graph_two_byte = true
 [Feed_Command]
 enabled = false
 # channels =
+# Allow private/internal feed URLs (default false for SSRF safety)
+allow_private_urls = false
 
 ####################################################################################################
 #                                                                                                  #
@@ -1289,18 +1439,17 @@ enabled = false
 # Enable web viewer (true/false). false recommended unless you have configured web_viewer_password.
 enabled = false
 
-# Password to protect the web viewer UI (BUG-001 fix)
-# If set, a login page is shown and all routes + SocketIO connections require authentication.
-# If left empty, the web viewer is accessible without any authentication.
+# If set to a non-empty value, a login page is shown and all routes + SocketIO require auth.
+# If empty, unset, "", or a null placeholder (none / null / nil), authentication is disabled.
 # Recommendation: always set a password when host != 127.0.0.1
 # web_viewer_password = changeme
 
 # Web viewer host address
 # SECURITY WARNING:
 # - 127.0.0.1: Only accessible from localhost (SECURE - recommended)
-# - 0.0.0.0: Accessible from any network interface (use only with web_viewer_password set)
+# - 0.0.0.0: Accessible from any network interface (strongly recommend web_viewer_password)
 #
-# Using 0.0.0.0 without web_viewer_password will expose:
+# Using 0.0.0.0 without a password is allowed but logs an ERROR at startup; it exposes:
 # - All messages and their contents
 # - Contact list and repeater information
 # - Real-time packet stream
@@ -1321,6 +1470,17 @@ debug = false
 # true: Start web viewer automatically when bot starts
 # false: Start web viewer manually (recommended)
 auto_start = false
+
+# Optional timeout overrides for web viewer integration (seconds)
+# edge_post_timeout_sec = 1.0
+# node_post_timeout_sec = 0.5
+# sqlite_connect_timeout_sec = 60.0
+# requeue_put_timeout_sec = 60.0
+# integration_shutdown_join_timeout_sec = 5.0
+# viewer_stop_grace_timeout_sec = 5.0
+# viewer_stop_force_timeout_sec = 2.0
+# port_cleanup_lsof_timeout_sec = 5.0
+# port_cleanup_kill_timeout_sec = 2.0
 
 # Optional: database path for web viewer. If unset, the viewer uses [Bot] db_path (recommended).
 # Only set this if you use a separate database for the viewer; you will see a startup warning.
@@ -1366,6 +1526,20 @@ verbose = false
 # true: Show all debugging information
 # false: Standard logging
 debug = false
+
+# Skip RAW_DATA publish when the same hex was just handled from RX_LOG_DATA (seconds).
+raw_duplicate_window = 2.0
+
+# Keep RX_LOG SNR/RSSI keyed by packet prefix this long for RAW_DATA correlation (seconds).
+rf_data_cache_timeout = 15.0
+
+# If true, do not publish packet JSON to MQTT when content hash is 0000000000000000
+# (strict path_len reject, too-short buffer, or other unparseable cases). File output is unchanged.
+mqtt_skip_unparseable_packets = true
+
+# If true, do not publish ADVERT packets to MQTT when mesh payload fails Ed25519 verification
+# (MeshCore createAdvert signature over pubkey || timestamp || app_data). File output is unchanged.
+advert_require_valid_signature = false
 
 # Owner information (for packet analyzer registration)
 # Owner public key (64-character hex string)
@@ -1433,6 +1607,9 @@ mqtt1_topic_packets = meshcore/{IATA}/{PUBLIC_KEY}/packets
 mqtt1_websocket_path = /mqtt
 mqtt1_client_id = 
 mqtt1_upload_packet_types = 
+# Optional per-broker JWT (inherit globals if omitted):
+# mqtt1_jwt_ttl_seconds = 3600           # JWT exp claim: iat + this many seconds
+# mqtt1_jwt_renewal_interval = 1800      # Refresh password this often; use < ttl; 0 = no renewal loop
 
 # MQTT Broker 2 - Let's Mesh Analyzer (EU)
 mqtt2_enabled = true
@@ -1455,7 +1632,12 @@ stats_in_status_enabled = true
 # Stats refresh interval (seconds)
 stats_refresh_interval = 300
 
-# JWT renewal interval (seconds, 0 = disabled)
+# JWT TTL in seconds: exp − iat in the MQTT auth token (default 86400 = 24 hours)
+jwt_ttl_seconds = 86400
+
+# JWT renewal interval (seconds): default cadence for proactive token refresh per broker.
+# 0 here makes the default broker renewal interval 0 (no renewal task unless a broker sets mqttN_jwt_renewal_interval > 0).
+# Tokens are still created at MQTT connect and on reconnect.
 jwt_renewal_interval = 86400
 
 # Health check interval (seconds, 0 = disabled)
@@ -1493,46 +1675,13 @@ min_reupload_interval = 3600
 # false: Standard logging (default)
 verbose = false
 
-[MqttWeather]
-# MQTT subscriber for custom.mqtt_weather.* topics (requires paho-mqtt). Service plugin: mqtt_weather_service.
-# Topic strings belong under [Weather]: custom.mqtt_weather.default and custom.mqtt_weather.<name> (see that section).
-enabled = false
-
-# Broker connection (required when enabled and at least one custom.mqtt_weather.* topic is set)
-# broker = mqtt.example.com
-# port = 1883
-# transport = tcp
-# For WebSockets: transport = websockets, set port (e.g. 443), websocket_path, often use_tls = true
-# websocket_path = /mqtt
-# use_tls = false
-# username =
-# password =
-# client_id =
-# qos = 0
-
-# Drop incoming MQTT payloads larger than this (bytes)
-# max_payload_bytes = 65536
-
-# Cached reading is stale after this many seconds (no fresh message on topic)
-# stale_after_seconds = 3600
-
-# passthrough: UTF-8 payload sanitized and truncated for mesh (JSON or plain text)
-# json_template: JSON object only; format with fixed placeholders (no arbitrary key paths)
-# output_mode = passthrough
-# output_mode = json_template
-# Allowed placeholders in json_template: {time} {temperature_f} {temperature_c} {humidity} {device}
-# json_template = {time} | {temperature_f} F / {temperature_c} C | RH {humidity}%
-
-# Optional filter: only accept JSON objects where the given key's string value matches
-# json_device_key = device
-# json_device_value = 231
-
-# Max output length after sanitize (characters)
-# passthrough_max_length = 500
-
 [Weather_Service]
 # Enable weather service for scheduled forecasts and alert monitoring (true/false)
 enabled = false
+
+# Optional regional TC_FLOOD scope for mesh channel posts from this service.
+# Omit to use [Channels] outgoing_flood_scope_override, or global flood if neither is set.
+# flood_scope = #west
 
 # Daily weather forecast time
 # Format: HH:MM (24-hour format, e.g., "6:00" for 6 AM)
@@ -1578,10 +1727,51 @@ blitz_collection_interval = 600000
 # blitz_area_max_lat = 48.76
 # blitz_area_max_lon = 18.62
 
+[MqttWeather]
+# MQTT subscriber for custom.mqtt_weather.* topics (requires paho-mqtt). Service plugin: mqtt_weather_service.
+# Topic strings belong under [Weather]: custom.mqtt_weather.default and custom.mqtt_weather.<name> (see that section).
+enabled = false
+
+# Broker connection (required when enabled and at least one custom.mqtt_weather.* topic is set)
+# broker = mqtt.example.com
+# port = 1883
+# transport = tcp
+# For WebSockets: transport = websockets, set port (e.g. 443), websocket_path, often use_tls = true
+# websocket_path = /mqtt
+# use_tls = false
+# username =
+# password =
+# client_id =
+# qos = 0
+
+# Drop incoming MQTT payloads larger than this (bytes)
+# max_payload_bytes = 65536
+
+# Cached reading is stale after this many seconds (no fresh message on topic)
+# stale_after_seconds = 3600
+
+# passthrough: UTF-8 payload sanitized and truncated for mesh (JSON or plain text)
+# json_template: JSON object only; format with fixed placeholders (no arbitrary key paths)
+# output_mode = passthrough
+# output_mode = json_template
+# Allowed placeholders in json_template: {time} {temperature_f} {temperature_c} {humidity} {device}
+# json_template = {time} | {temperature_f} F / {temperature_c} C | RH {humidity}%
+# Literal percent signs (e.g. % RH) are fine. Format specs like {pressure_hpa:.0f} work on numeric fields.
+
+# Optional filter: only accept JSON objects where the given key's string value matches
+# json_device_key = device
+# json_device_value = 231
+
+# Max output length after sanitize (characters)
+# passthrough_max_length = 500
+
 [Earthquake_Service]
 # Enable earthquake alert service (true/false)
 # Polls USGS Earthquake API and posts alerts to a channel when quakes occur in the configured region
 enabled = false
+
+# Optional regional TC_FLOOD scope for mesh channel posts from this service.
+# flood_scope = #west
 
 # Channel to post earthquake alerts to
 channel = #general
@@ -1657,6 +1847,12 @@ port = 8765
 # Channel message:
 #   {"channel": "general", "message": "Hello from webhook!"}
 #
+# Optional per-request regional scope (overrides [Webhook] flood_scope below):
+#   {"channel": "general", "message": "Hello", "flood_scope": "#west"}
+#
+# Optional default regional scope for all webhook channel posts:
+# flood_scope = #west
+#
 # Direct message:
 #   {"dm_to": "SomeUser", "message": "Private message"}
 #
@@ -1669,9 +1865,12 @@ port = 8765
 # posts a message when a newly heard repeater shares a prefix with an existing repeater.
 enabled = false
 
+# Optional regional TC_FLOOD scope for mesh channel posts from this service.
+# flood_scope = #west
+
 # Channels to post alerts to (comma-separated).
 # Prefer this option if you want multiple channels.
-channels = #general
+channels = #mybotchannel
 
 # Fallback single channel option (used only when channels= is not set).
 # channel = #general
@@ -1789,6 +1988,34 @@ enabled = false
 # See docs/telegram-bridge.md for setup
 # bridge.Public = @YourChannelName
 # bridge.emergency = -1001234567890
+
+[DARC_MoWaS_Service]
+# Enable DARC MoWaS (Mobile Warning System) integration for receiving and posting warnings
+# For legal requirements and backend configuration, please read https://www.darc.de/index.php?id=58435 before operating.
+# Limit mesh reach via flood_scope here or [Channels] outgoing_flood_scope_override / flood_scopes.
+enabled = false
+
+# Optional regional TC_FLOOD scope for mesh channel posts from this service.
+# flood_scope = #west
+
+# Listen address and port of webserver that receives the webhook POSTs from DARC MoWaS.
+# Must be accessible from the internet (or HAMNET) for MoWaS to reach it.
+# host = localhost
+# port = 8081
+
+# Language specific channel for redistribution of warnings received from MoWaS.
+# The non german channels are only served if a warning is available in that language
+# Only "de" and "en" are currently supported as language codes.
+# The channels are automatically created if they don't exist.
+# channel_de = #mowas
+# channel_en = #mowas-en
+
+# Download warning messages from MoWaS in HAMNET instead of internet.
+# hamnet = false
+
+# Retry messages that are not acked by at least a single repeater after retry_timeout (in seconds)
+# retry_max = 2
+# retry_timeout = 15
 
 # -----------------------------------------------------------------------------
 # Check-in service (local plugin: local/service_plugins/checkin_service.py)

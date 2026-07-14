@@ -11,7 +11,8 @@ import time
 from typing import Any, Callable, Optional
 
 from ..models import MeshMessage
-from ..utils import calculate_distance, parse_path_string
+from ..security_utils import sanitize_name
+from ..utils import bytes_per_hop_from_routing_and_nodes, calculate_distance, parse_path_string
 from .base_command import BaseCommand
 
 
@@ -138,6 +139,18 @@ class PathCommand(BaseCommand):
             if "p" not in self.keywords:
                 self.keywords.append("p")
 
+        reply_prefix_raw = bot.config.get('Path_Command', 'reply_prefix', fallback='')
+        self.path_reply_prefix = self._strip_quotes_from_config(reply_prefix_raw).strip()
+
+        minimum_path_bytes_raw = bot.config.getint('Path_Command', 'minimum_path_bytes', fallback=0)
+        if minimum_path_bytes_raw not in (0, 1, 2, 3):
+            self.logger.warning(
+                f"Invalid Path_Command.minimum_path_bytes={minimum_path_bytes_raw}; defaulting to 0"
+            )
+            self.minimum_path_bytes = 0
+        else:
+            self.minimum_path_bytes = minimum_path_bytes_raw
+
         try:
             # Try to get location from Bot section
             if bot.config.has_section('Bot'):
@@ -165,6 +178,45 @@ class PathCommand(BaseCommand):
         except Exception as e:
             self.logger.warning(f"Error reading bot location from config: {e} - geographic proximity guessing disabled")
 
+    def _bytes_per_hop_from_nodes_and_routing(
+        self, node_ids: list[str], routing_info: Optional[dict[str, Any]]
+    ) -> int:
+        """Bytes per hop from packet metadata or inferred from hex node width."""
+        return bytes_per_hop_from_routing_and_nodes(routing_info, node_ids)
+
+    def _should_resolve_repeater_names(
+        self, node_ids: list[str], routing_info: Optional[dict[str, Any]]
+    ) -> bool:
+        if self.minimum_path_bytes in (0, 1):
+            return True
+        bph = self._bytes_per_hop_from_nodes_and_routing(node_ids, routing_info)
+        return bph >= self.minimum_path_bytes
+
+    def _format_path_reply_prefix(self, message: MeshMessage) -> str:
+        if not self.path_reply_prefix:
+            return ''
+        formatted = self.format_response(message, self.path_reply_prefix).rstrip()
+        if not formatted:
+            return ''
+        return formatted + '\n'
+
+    def _format_repeater_resolution_deferred(self, node_ids: list[str]) -> str:
+        path_display = ','.join(node_ids)
+        return self.translate(
+            'commands.path.repeater_resolution_deferred',
+            path=path_display,
+            minimum_path_bytes=self.minimum_path_bytes,
+        )
+
+    async def _decode_node_ids(
+        self, node_ids: list[str], routing_info: Optional[dict[str, Any]] = None
+    ) -> str:
+        self.logger.info(f"Decoding path with {len(node_ids)} nodes: {','.join(node_ids)}")
+        if not self._should_resolve_repeater_names(node_ids, routing_info):
+            return self._format_repeater_resolution_deferred(node_ids)
+        repeater_info = await self._lookup_repeater_names(node_ids)
+        return self._format_path_response(node_ids, repeater_info)
+
     def can_execute(self, message: MeshMessage, skip_channel_check: bool = False) -> bool:
         """Check if this command can be executed with the given message.
 
@@ -180,19 +232,13 @@ class PathCommand(BaseCommand):
 
     def matches_keyword(self, message: MeshMessage) -> bool:
         """Check if message starts with 'path' keyword or 'p' shortcut (if enabled)"""
-        content = message.content.strip()
-
-        # Handle exclamation prefix
-        if content.startswith('!'):
-            content = content[1:].strip()
-
-        content_lower = content.lower()
+        content_lower = self.cleanup_message_for_matching(message)
 
         # Handle "p" shortcut if enabled
         if self.enable_p_shortcut:
             if content_lower == "p":
                 return True  # Just "p" by itself
-            elif (content.startswith('p ') or content.startswith('P ')) and len(content) > 2:
+            elif content_lower.startswith('p ') and len(content_lower) > 2:
                 return True  # "p " followed by path data
 
         # Check if message starts with any of our keywords
@@ -201,6 +247,9 @@ class PathCommand(BaseCommand):
     async def execute(self, message: MeshMessage) -> bool:
         """Execute path decode command"""
         self.logger.info(f"Path command executed with content: {message.content}")
+
+        if not await self.enforce_path_byte_requirement(message, 'Path_Command'):
+            return True
 
         # Store the current message for use in _extract_path_from_recent_messages
         self._current_message = message
@@ -221,7 +270,9 @@ class PathCommand(BaseCommand):
         await self._send_path_response(message, response)
         return True
 
-    async def _decode_path(self, path_input: str) -> str:
+    async def _decode_path(
+        self, path_input: str, routing_info: Optional[dict[str, Any]] = None
+    ) -> str:
         """Decode hex path data to repeater names.
         Comma-separated tokens infer hop size (2, 4, or 6 hex chars per node).
         Otherwise uses bot.prefix_hex_chars via parse_path_string().
@@ -251,9 +302,7 @@ class PathCommand(BaseCommand):
             if not node_ids:
                 return self.translate('commands.path.no_valid_hex')
 
-            self.logger.info(f"Decoding path with {len(node_ids)} nodes: {','.join(node_ids)}")
-            repeater_info = await self._lookup_repeater_names(node_ids)
-            return self._format_path_response(node_ids, repeater_info)
+            return await self._decode_node_ids(node_ids, routing_info)
 
         except Exception as e:
             self.logger.error(f"Error decoding path: {e}")
@@ -775,7 +824,7 @@ class PathCommand(BaseCommand):
             # Apply star bias multiplier if repeater is starred
             if repeater.get('is_starred', False):
                 combined_score *= self.star_bias_multiplier
-                self.logger.debug(f"Applied star bias ({self.star_bias_multiplier}x) to {repeater.get('name', 'unknown')}")
+                self.logger.debug(f"Applied star bias ({self.star_bias_multiplier}x) to {sanitize_name(repeater.get('name', 'unknown'))}")
 
             # SNR bonus: If repeater has SNR data, it's a zero-hop repeater (direct neighbor)
             # This is strong evidence it's close and should be preferred
@@ -784,7 +833,7 @@ class PathCommand(BaseCommand):
                 # Add bonus proportional to zero-hop bonus (20% of combined score)
                 snr_bonus = combined_score * 0.2
                 combined_score += snr_bonus
-                self.logger.debug(f"SNR bonus for {repeater.get('name', 'unknown')}: +{snr_bonus:.3f} (has SNR data, confirmed zero-hop)")
+                self.logger.debug(f"SNR bonus for {sanitize_name(repeater.get('name', 'unknown'))}: +{snr_bonus:.3f} (has SNR data, confirmed zero-hop)")
 
             combined_scores.append((combined_score, distance, repeater))
 
@@ -1171,7 +1220,7 @@ class PathCommand(BaseCommand):
             # Apply star bias multiplier if repeater is starred
             if repeater.get('is_starred', False):
                 combined_score *= self.star_bias_multiplier
-                self.logger.debug(f"Applied star bias ({self.star_bias_multiplier}x) to {repeater.get('name', 'unknown')}")
+                self.logger.debug(f"Applied star bias ({self.star_bias_multiplier}x) to {sanitize_name(repeater.get('name', 'unknown'))}")
 
             # SNR bonus: If repeater has SNR data, it's a zero-hop repeater (direct neighbor)
             # This is strong evidence it's close and should be preferred
@@ -1180,7 +1229,7 @@ class PathCommand(BaseCommand):
                 # Add bonus proportional to zero-hop bonus (20% of combined score)
                 snr_bonus = combined_score * 0.2
                 combined_score += snr_bonus
-                self.logger.debug(f"SNR bonus for {repeater.get('name', 'unknown')}: +{snr_bonus:.3f} (has SNR data, confirmed zero-hop)")
+                self.logger.debug(f"SNR bonus for {sanitize_name(repeater.get('name', 'unknown'))}: +{snr_bonus:.3f} (has SNR data, confirmed zero-hop)")
 
             if combined_score > best_combined_score:
                 best_combined_score = combined_score
@@ -1254,7 +1303,7 @@ class PathCommand(BaseCommand):
             # Apply star bias multiplier if repeater is starred
             if repeater.get('is_starred', False):
                 combined_score *= self.star_bias_multiplier
-                self.logger.debug(f"Applied star bias ({self.star_bias_multiplier}x) to {repeater.get('name', 'unknown')}")
+                self.logger.debug(f"Applied star bias ({self.star_bias_multiplier}x) to {sanitize_name(repeater.get('name', 'unknown'))}")
 
             # SNR bonus: If repeater has SNR data, it's a zero-hop repeater (direct neighbor)
             # This is strong evidence it's close and should be preferred
@@ -1263,7 +1312,7 @@ class PathCommand(BaseCommand):
                 # Add bonus proportional to zero-hop bonus (20% of combined score)
                 snr_bonus = combined_score * 0.2
                 combined_score += snr_bonus
-                self.logger.debug(f"SNR bonus for {repeater.get('name', 'unknown')}: +{snr_bonus:.3f} (has SNR data, confirmed zero-hop)")
+                self.logger.debug(f"SNR bonus for {sanitize_name(repeater.get('name', 'unknown'))}: +{snr_bonus:.3f} (has SNR data, confirmed zero-hop)")
 
             all_scores.append((repeater.get('name', 'unknown'), distance, recency_score, proximity_score, combined_score))
 
@@ -1364,7 +1413,7 @@ class PathCommand(BaseCommand):
                         stored_to_key = prev_to_candidate_edge.get('to_public_key', '').lower() if prev_to_candidate_edge.get('to_public_key') else None
                         if stored_to_key and stored_to_key == candidate_public_key:
                             stored_key_bonus = max(stored_key_bonus, 0.4)  # Strong bonus for matching stored key
-                            self.logger.debug(f"Found stored public key match for {repeater.get('name', 'unknown')} in edge {prev_norm}->{candidate_norm}")
+                            self.logger.debug(f"Found stored public key match for {sanitize_name(repeater.get('name', 'unknown'))} in edge {prev_norm}->{candidate_norm}")
 
                 # Check edge from candidate to next node
                 if next_norm:
@@ -1373,7 +1422,7 @@ class PathCommand(BaseCommand):
                         stored_from_key = candidate_to_next_edge.get('from_public_key', '').lower() if candidate_to_next_edge.get('from_public_key') else None
                         if stored_from_key and stored_from_key == candidate_public_key:
                             stored_key_bonus = max(stored_key_bonus, 0.4)  # Strong bonus for matching stored key
-                            self.logger.debug(f"Found stored public key match for {repeater.get('name', 'unknown')} in edge {candidate_norm}->{next_norm}")
+                            self.logger.debug(f"Found stored public key match for {sanitize_name(repeater.get('name', 'unknown'))} in edge {candidate_norm}->{next_norm}")
 
             # Zero-hop bonus: If this repeater has been heard directly by the bot (zero-hop advert),
             # it's strong evidence it's close and should be preferred, even for intermediate hops.
@@ -1384,7 +1433,7 @@ class PathCommand(BaseCommand):
             if hop_count is not None and hop_count == 0 and graph_score > 0:
                 # This repeater has been heard directly - strong evidence it's close to bot
                 zero_hop_bonus = self.graph_zero_hop_bonus
-                self.logger.debug(f"Zero-hop bonus for {repeater.get('name', 'unknown')}: {zero_hop_bonus:.2%} (heard directly by bot)")
+                self.logger.debug(f"Zero-hop bonus for {sanitize_name(repeater.get('name', 'unknown'))}: {zero_hop_bonus:.2%} (heard directly by bot)")
 
             # SNR bonus: If this repeater has SNR data, it's a zero-hop repeater (direct neighbor)
             # This is even stronger evidence than just hop_count == 0, as it means we have actual signal quality data.
@@ -1395,7 +1444,7 @@ class PathCommand(BaseCommand):
                 # SNR presence indicates zero-hop connection with signal quality data
                 # Use same bonus as zero-hop, but this is more definitive
                 snr_bonus = self.graph_zero_hop_bonus * 1.2  # 20% stronger than zero-hop bonus alone
-                self.logger.debug(f"SNR bonus for {repeater.get('name', 'unknown')}: {snr_bonus:.2%} (has SNR data, confirmed zero-hop)")
+                self.logger.debug(f"SNR bonus for {sanitize_name(repeater.get('name', 'unknown'))}: {snr_bonus:.2%} (has SNR data, confirmed zero-hop)")
 
             # Add stored key bonus, zero-hop bonus, and SNR bonus to graph score
             graph_score_with_bonus = min(1.0, graph_score + stored_key_bonus + zero_hop_bonus + snr_bonus)
@@ -1460,7 +1509,7 @@ class PathCommand(BaseCommand):
                                     path_validation_bonus = max(path_validation_bonus, segment_bonus + obs_bonus)
                                     # Cap at max bonus
                                     path_validation_bonus = min(self.graph_path_validation_max_bonus, path_validation_bonus)
-                                    self.logger.debug(f"Path validation match for {repeater.get('name', 'unknown')}: {common_segments} common segments (obs: {obs_count})")
+                                    self.logger.debug(f"Path validation match for {sanitize_name(repeater.get('name', 'unknown'))}: {common_segments} common segments (obs: {obs_count})")
                                     if path_validation_bonus >= self.graph_path_validation_max_bonus * 0.9:
                                         break  # Strong match found
                 except Exception as e:
@@ -1527,7 +1576,7 @@ class PathCommand(BaseCommand):
                         # Apply penalty: up to penalty_strength reduction
                         penalty = normalized_excess * self.graph_distance_penalty_strength
                         candidate_score = candidate_score * (1.0 - penalty)
-                        self.logger.debug(f"Applied distance penalty to {repeater.get('name', 'unknown')}: {max_distance:.1f}km hop (penalty: {penalty:.2%}, score: {candidate_score:.3f})")
+                        self.logger.debug(f"Applied distance penalty to {sanitize_name(repeater.get('name', 'unknown'))}: {max_distance:.1f}km hop (penalty: {penalty:.2%}, score: {candidate_score:.3f})")
                     elif max_distance > 0:
                         # Even if under threshold, very long hops should get a small penalty
                         # This helps prefer shorter hops when graph evidence is similar
@@ -1555,7 +1604,7 @@ class PathCommand(BaseCommand):
                         # Apply max distance threshold if configured
                         if self.graph_final_hop_max_distance > 0 and distance > self.graph_final_hop_max_distance:
                             # Beyond max distance - skip proximity bonus
-                            self.logger.debug(f"Final hop candidate {repeater.get('name', 'unknown')} is {distance:.1f}km from bot, beyond max distance {self.graph_final_hop_max_distance:.1f}km")
+                            self.logger.debug(f"Final hop candidate {sanitize_name(repeater.get('name', 'unknown'))} is {distance:.1f}km from bot, beyond max distance {self.graph_final_hop_max_distance:.1f}km")
                         else:
                             # Normalize distance to 0-1 score (inverse: closer = higher score)
                             # Use configurable normalization distance (default 500km for more aggressive scoring)
@@ -1575,14 +1624,14 @@ class PathCommand(BaseCommand):
                             # Combine with graph score using effective weight
                             candidate_score = candidate_score * (1.0 - effective_weight) + proximity_score * effective_weight
 
-                            self.logger.debug(f"Final hop proximity for {repeater.get('name', 'unknown')}: distance={distance:.1f}km, proximity_score={proximity_score:.3f}, effective_weight={effective_weight:.3f}, combined_score={candidate_score:.3f}")
+                            self.logger.debug(f"Final hop proximity for {sanitize_name(repeater.get('name', 'unknown'))}: distance={distance:.1f}km, proximity_score={proximity_score:.3f}, effective_weight={effective_weight:.3f}, combined_score={candidate_score:.3f}")
                     else:
                         # Repeater without valid location data - apply significant penalty for final hop
                         # This ensures we prefer repeaters with known locations, especially direct neighbors
                         # Penalty: reduce score by 50% (repeaters with location data will have proximity bonus, so this creates strong preference)
                         location_penalty = 0.5
                         candidate_score = candidate_score * (1.0 - location_penalty)
-                        self.logger.debug(f"Final hop candidate {repeater.get('name', 'unknown')} has no valid location data - applying {location_penalty:.0%} penalty (score: {candidate_score:.3f})")
+                        self.logger.debug(f"Final hop candidate {sanitize_name(repeater.get('name', 'unknown'))} has no valid location data - applying {location_penalty:.0%} penalty (score: {candidate_score:.3f})")
 
             # Apply star bias multiplier if repeater is starred
             # Starred repeaters should get significant advantage in graph selection
@@ -1592,7 +1641,7 @@ class PathCommand(BaseCommand):
                 candidate_score *= self.star_bias_multiplier
                 # Cap at 1.0 but allow it to exceed temporarily for comparison
                 # We'll normalize later when converting to confidence
-                self.logger.debug(f"Applied star bias ({self.star_bias_multiplier}x) to {repeater.get('name', 'unknown')} in graph selection (score: {candidate_score:.3f})")
+                self.logger.debug(f"Applied star bias ({self.star_bias_multiplier}x) to {sanitize_name(repeater.get('name', 'unknown'))} in graph selection (score: {candidate_score:.3f})")
 
             if candidate_score > best_score:
                 best_score = candidate_score
@@ -1665,55 +1714,50 @@ class PathCommand(BaseCommand):
 
     async def _send_path_response(self, message: MeshMessage, response: str):
         """Send path response, splitting into multiple messages if necessary"""
-        # Store the complete response for web viewer integration BEFORE splitting
-        # command_manager will prioritize command.last_response over _last_response
-        # This ensures capture_command gets the full response, not just the last split message
-        self.last_response = response
+        prefix = self._format_path_reply_prefix(message)
+        self.last_response = prefix + response if prefix else response
 
-        # Get dynamic max message length based on message type and bot username
         max_length = self.get_max_message_length(message)
+        prefix_len = self._count_byte_length(prefix)
+        first_segment_max = max_length - prefix_len
+        if first_segment_max < 1:
+            first_segment_max = 1
 
-        if self._count_byte_length(response) <= max_length:
-            # Single message is fine
-            await self.send_response(message, response)
-        else:
-            # Split into multiple messages for over-the-air transmission
-            # But keep the full response in last_response for web viewer
-            lines = response.split('\n')
-            current_message = ""
-            message_count = 0
+        if self._count_byte_length(response) + prefix_len <= max_length:
+            await self.send_response(message, prefix + response)
+            return
 
-            for i, line in enumerate(lines):
-                # Check if adding this line would exceed max_length display width
-                if self._count_byte_length(current_message) + self._count_byte_length(line) + 1 > max_length:  # +1 for newline
-                    # Send current message and start new one
-                    if current_message:
-                        # Add ellipsis on new line to end of continued message (if not the last message)
-                        if i < len(lines):
-                            current_message += self.translate('commands.path.continuation_end')
-                        # Per-user rate limit applies only to first message (trigger); skip for continuations
-                        await self.send_response(
-                            message, current_message.rstrip(),
-                            skip_user_rate_limit=(message_count > 0)
-                        )
-                        await asyncio.sleep(3.0)  # Delay between messages (same as other commands)
-                        message_count += 1
+        lines = response.split('\n')
+        current_message = ""
+        message_count = 0
 
-                    # Start new message with ellipsis on new line at beginning (if not first message)
-                    if message_count > 0:
-                        current_message = self.translate('commands.path.continuation_start', line=line)
-                    else:
-                        current_message = line
+        for i, line in enumerate(lines):
+            body_budget = first_segment_max if message_count == 0 else max_length
+            if self._count_byte_length(current_message) + self._count_byte_length(line) + 1 > body_budget:
+                if current_message:
+                    if i < len(lines):
+                        current_message += self.translate('commands.path.continuation_end')
+                    out = (prefix + current_message.rstrip()) if message_count == 0 else current_message.rstrip()
+                    await self.send_response(
+                        message, out,
+                        skip_user_rate_limit=(message_count > 0)
+                    )
+                    await asyncio.sleep(3.0)
+                    message_count += 1
+
+                if message_count > 0:
+                    current_message = self.translate('commands.path.continuation_start', line=line)
                 else:
-                    # Add line to current message
-                    if current_message:
-                        current_message += f"\n{line}"
-                    else:
-                        current_message = line
+                    current_message = line
+            else:
+                if current_message:
+                    current_message += f"\n{line}"
+                else:
+                    current_message = line
 
-            # Send the last message if there's content (continuation; skip per-user rate limit)
-            if current_message:
-                await self.send_response(message, current_message, skip_user_rate_limit=True)
+        if current_message:
+            out = (prefix + current_message.rstrip()) if message_count == 0 else current_message.rstrip()
+            await self.send_response(message, out, skip_user_rate_limit=True)
 
     async def _extract_path_from_recent_messages(self) -> str:
         """Extract path from the current message's path information (same as test command).
@@ -1734,9 +1778,7 @@ class PathCommand(BaseCommand):
                 path_nodes = routing_info.get('path_nodes', [])
                 if path_nodes:
                     node_ids = [n.upper() for n in path_nodes]
-                    self.logger.info(f"Decoding path from routing_info with {len(node_ids)} nodes: {','.join(node_ids)}")
-                    repeater_info = await self._lookup_repeater_names(node_ids)
-                    return self._format_path_response(node_ids, repeater_info)
+                    return await self._decode_node_ids(node_ids, routing_info)
 
             # Fallback: parse message.path string (e.g. no routing_info or legacy path)
             if not msg.path:
@@ -1749,10 +1791,10 @@ class PathCommand(BaseCommand):
             path_part = path_string.split(" via ROUTE_TYPE_")[0] if " via ROUTE_TYPE_" in path_string else path_string
 
             if ',' in path_part:
-                return await self._decode_path(path_part)
+                return await self._decode_path(path_part, routing_info)
             hex_pattern = rf'[0-9a-fA-F]{{{getattr(self.bot, "prefix_hex_chars", 2)}}}'
             if re.search(hex_pattern, path_part):
-                return await self._decode_path(path_part)
+                return await self._decode_path(path_part, routing_info)
             return self.translate('commands.path.path_prefix', path_string=path_string)
 
         except Exception as e:

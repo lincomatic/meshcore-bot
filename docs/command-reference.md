@@ -86,14 +86,47 @@ greetings
 
 ### `cmd`
 
-List available commands in compact format.
+List available commands in compact format, or return a configured reference URL.
 
 **Usage:**
 ```
 cmd
 ```
 
-**Response:** Compact list of all available commands.
+**Response:** Compact list of all available commands, unless `[Cmd_Command]` sets `cmd_reference_url` — then the bot replies with `Full command reference: <url>` instead of the inline list.
+
+**Configuration:** `[Cmd_Command]` — `enabled`, `cmd_reference_url` (optional).
+
+---
+
+### `version` or `ver`
+
+Show the bot's current software version.
+
+**Aliases:** `ver`
+
+**Usage:**
+```
+version
+ver
+```
+
+**Response:** `@[User] Bot version: v0.9.x` (or branch-commit on non-release builds).
+
+**Configuration:** `[Version_Command]` — `enabled` (default true).
+
+---
+
+### `status`
+
+Show current bot and radio status details.
+
+**Usage:**
+```
+status
+```
+
+**Response:** Runtime status summary (connection/health information).
 
 ---
 
@@ -144,8 +177,10 @@ wxa 10001
 
 **Response:** Current weather conditions, forecast for tonight/tomorrow, and active weather alerts. Includes:
 - Current conditions (temperature, humidity, wind, etc.)
-- Short-term forecast (tonight, tomorrow)
+- Short-term forecast (tonight, tomorrow) with **high/low** temperatures when available
 - Weather alerts if any are active
+
+**Configuration:** `[Weather]` — `weather_provider` (`noaa` or `openmeteo`), `temperature_high_low_format`, `use_bot_location_when_no_location`, and optional **`custom.mqtt_weather.*`** topics for MQTT-sourced weather.
 
 **Note:** Weather alerts are automatically included when available.
 
@@ -177,11 +212,11 @@ gwx 35.6762,139.6503
 - Current temperature and conditions
 - Feels-like temperature
 - Wind speed and direction
-- Humidity
-- Dew point
-- Visibility
-- Pressure
-- Forecast for today/tonight and tomorrow
+- Humidity, dew point, visibility, pressure
+- Forecast with **high/low** temperatures
+- **Multi-day** forecasts when requested (e.g. `gwx Tokyo 7` or `7d` suffix — see `config.ini.example`)
+
+**Configuration:** `[Weather]` — `openmeteo_model` (model selection), `use_bot_location_when_no_location` (fallback when no location in message), `temperature_high_low_format`, and optional **`custom.mqtt_weather.<name>`** MQTT topics.
 
 ---
 
@@ -253,7 +288,7 @@ overhead <latitude>,<longitude>
 - `ladd` - Show only LADD aircraft
 - `pia` - Show only PIA aircraft
 - `squawk=<code>` - Filter by transponder squawk code
-- `limit=<n>` - Limit number of results (default: 10, max: 50)
+- `limit=<n>` - Limit API fetch size (overrides `[Airplanes_Command]` `max_results` for this request)
 - `closest` - Sort by distance (closest first)
 - `highest` - Sort by altitude (highest first)
 - `fastest` - Sort by speed (fastest first)
@@ -272,15 +307,14 @@ airplanes 47.6,-122.3 radius=25 closest
 ```
 
 **Response:**
-- **Single aircraft**: Detailed format with callsign, type, altitude, speed, track, distance, bearing, vertical rate, and registration
-- **Multiple aircraft**: Compact list format with callsign, altitude, speed, distance, and bearing
+- **Single aircraft** (`overhead`): Detailed format with callsign, type, altitude, speed, track, distance, bearing, vertical rate, and registration
+- **Multiple aircraft**: All matches are packed into **one mesh message** (RF length limited). If not everything fits, the reply ends with `...+N more` for the remainder count
 
-**Configuration:**
-The command can be configured in `config.ini` under `[Airplanes_Command]`:
+**Configuration:** `[Airplanes_Command]`:
 - `enabled` - Enable/disable the command
 - `api_url` - API endpoint URL (default: `http://api.airplanes.live/v2/`)
 - `default_radius` - Default search radius in nautical miles
-- `max_results` - Maximum number of results to return
+- `max_results` - Default API result cap (`0` = no configured cap; output is still bounded by single-message RF limits)
 - `url_timeout` - API request timeout in seconds
 
 **Note:** Uses companion location from database if available, otherwise falls back to bot location from config. The API is rate-limited to 1 request per second.
@@ -299,6 +333,20 @@ sun
 **Response:** Sunrise and sunset times, day length, and solar noon.
 
 **Note:** Uses the bot's configured default location (`bot_latitude` and `bot_longitude` in config.ini), not the user's location from their advert.
+
+---
+
+### `aurora`
+
+Get aurora visibility/forecast conditions for configured or provided coordinates.
+
+**Usage:**
+```
+aurora
+aurora <lat>,<lon>
+```
+
+**Response:** Aurora activity and visibility guidance for the requested location.
 
 ---
 
@@ -498,6 +546,25 @@ roll 1000
 
 ---
 
+### `magic8`
+
+Ask the Magic 8-Ball a yes/no question.
+
+**Usage:**
+```
+magic8 <question>
+```
+
+**Examples:**
+```
+magic8 will the mesh be busy tonight?
+magic8 should I deploy another node?
+```
+
+**Response:** A randomized Magic 8-Ball style answer.
+
+---
+
 ## Entertainment Commands
 
 ### `joke`
@@ -557,6 +624,45 @@ ls -l /secret/base
 
 ---
 
+### `catfact`
+
+Get a random cat fact.
+
+**Usage:**
+```
+catfact
+```
+
+**Response:** A short random cat fact.
+
+---
+
+### RandomLine (configurable triggers)
+
+Not a single fixed command name — **`[RandomLine]`** defines trigger words that return a random line from a text file. Useful for fortunes, facts, or custom responses.
+
+**Example config** (see `config.ini.example`):
+
+```ini
+[RandomLine]
+triggers.fortune = fortune,fortunes
+file.fortune = data/randomlines/fortunes.txt
+prefix.fortune = 🥠
+```
+
+**Usage:** Send an exact trigger word (e.g. `fortune`) as the message or command stem.
+
+**Options per entry:**
+- `triggers.<key>` — Comma-separated trigger words (exact match after parsing)
+- `file.<key>` — Path to line-delimited text file (BSD fortune format supported)
+- `prefix.<key>` — String prepended to the chosen line
+- `channel.<key>` / `channels.<key>` — Restrict to specific channels
+- `category.<key>` — Website command-reference category
+
+There is no separate built-in `fortune` command — use RandomLine with a fortunes file.
+
+---
+
 ## Sports Commands
 
 ### `sports`
@@ -584,7 +690,9 @@ sports mlb
 
 ### `path` or `decode` or `route`
 
-Decode and display the routing path of a message.
+Decode and display the routing path of a message. Supports **multi-byte** hop encodings (1-, 2-, and 3-byte prefixes) when present in the path.
+
+**Aliases:** `decode`, `route`
 
 **Usage:**
 ```
@@ -593,7 +701,13 @@ decode
 route
 ```
 
-**Response:** Shows the complete routing path the message took through the mesh network, including all intermediate nodes.
+**Response:** Routing path through the mesh, including intermediate nodes. Repeater selection may use graph validation, proximity scoring, and configured presets.
+
+**Configuration:** `[Path_Command]` — see [Path Command](path-command-config.md) for presets, graph settings, and tuning. Key option:
+
+- **`geographic_scoring_enabled`** (default `true`) — When `false`, geographic proximity guessing is disabled for path decode. This is a **config** toggle, not a chat subcommand.
+
+Optional **`enable_p_shortcut`** (default true) allows abbreviated path selection flows documented in the Path Command guide.
 
 ---
 
@@ -682,8 +796,6 @@ mt
 ```
 
 **Response:** List of all unique routing paths discovered during the 6-second listening period.
-
----
 
 ## Command Syntax
 
@@ -823,9 +935,9 @@ repeater stats
 - NEW_CONTACT events are automatically monitored
 - Repeaters are automatically cataloged when discovered
 - Contact list capacity is monitored in real-time
-- `auto_manage_contacts = device`: Device handles auto-addition, bot manages capacity
-- `auto_manage_contacts = bot`: Bot automatically adds companion contacts and manages capacity
-- `auto_manage_contacts = false`: Manual mode - use `!repeater` commands to manage contacts
+- `auto_manage_contacts = device`: Firmware auto-adds **chat (companion)** peers only, with **overwrite oldest non-favourite** when the contact table is full; the bot schedules delayed jobs to set that firmware policy and to **favourite** keys in `Admin_ACL` plus the effective announcements ACL (same rules as the announcements command), then clear **favourite** on other contacts. The bot still runs capacity management on NEW_CONTACT (near-limit `manage_contact_list`) and does **not** call `add_contact` for new companions itself. **Contact limit** for logging and capacity is taken from the radio’s `max_contacts` and, if the live table is larger (under-reported max), raised to match the mesh so counts are not shown as over-capacity. **Companion auto-purge** never runs on the radio in this mode. Count-based **repeater** auto-purge only runs if the table grows **strictly above** that synced limit (normally off while the firmware manages slots).
+- `auto_manage_contacts = bot`: Bot adds new companions via `add_contact` (full NEW_CONTACT payload), runs **manage-before-add** when the list is near limit, and **retries once** after `manage_contact_list` if the radio returns `TABLE_FULL`.
+- `auto_manage_contacts = false`: Manual mode - NEW_CONTACT companions are tracked in the database only; use `!repeater` commands to manage the device list.
 
 ---
 
@@ -844,6 +956,50 @@ advert
 - DM only command
 - 1-hour cooldown period between uses
 - Sends a flood advert to all nodes on the network
+
+---
+
+### `reload`
+
+Reload supported runtime configuration without restarting the bot.
+
+**Usage:**
+```
+reload
+```
+
+**Response:** Confirms reload success or reports validation/loading errors.
+
+**Note:** Admin DM command. Connection/radio settings still require a process restart.
+
+---
+
+### `channelpause` / `channelresume`
+
+Temporarily pause or resume bot reactions on public channels.
+
+**Usage:**
+```
+channelpause
+channelresume
+```
+
+**Response:** Confirms whether channel handling is paused or resumed.
+
+**Note:** Admin DM command. DMs continue to work while channel responses are paused.
+
+---
+
+### `greeter`
+
+Show greeter behavior and configuration guidance.
+
+**Usage:**
+```
+greeter
+```
+
+**Response:** Describes greeter mode and points to `[Greeter_Command]` settings in config.
 
 ---
 
@@ -879,6 +1035,38 @@ feed test https://example.com/feed.xml
 **Response:** Confirmation of the action or list of subscriptions.
 
 **Note:** Admin access required. Feeds are automatically checked and posted to the specified channel.
+
+---
+
+### `announcements`
+
+Manage announcement ACL and related announcement settings.
+
+**Usage:**
+```
+announcements <subcommand> [args]
+```
+
+**Response:** Shows current announcement ACL or confirms changes.
+
+**Note:** Admin access required.
+
+---
+
+### `schedule`
+
+View configured scheduled messages and advert interval.
+
+**Usage:**
+```
+schedule
+```
+
+**Response:** Lists scheduled posts from `[Scheduled_Messages]` (cron or preset schedule, or legacy `HH:MM` keys) plus current advert timing. Scoped entries show regional flood scope when configured (`channel:#scope:message`).
+
+**Configuration:** `[Schedule_Command]` — `enabled`, `dm_only` (default true: schedule is visible in DMs only unless changed).
+
+**Note:** Admin-level visibility; configure `dm_only = false` to allow channel use.
 
 ---
 

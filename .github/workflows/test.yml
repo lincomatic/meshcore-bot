@@ -51,6 +51,7 @@ jobs:
             -not -path "./node_modules/*" \
             -not -path "./.venv/*" \
             -not -path "./venv/*" \
+            -not -path "./dist/*" \
             -print0 | xargs -0 shellcheck --severity=warning
 
   lint:
@@ -70,6 +71,9 @@ jobs:
 
       - name: ruff check — fail on any lint error
         run: ruff check modules/ tests/
+
+      - name: Log injection check — fail on new unsanitized logger calls
+        run: python scripts/check_log_injection.py
 
   typecheck:
     name: Type check (mypy)
@@ -98,7 +102,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
 

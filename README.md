@@ -2,12 +2,20 @@
 
 A Python bot that connects to MeshCore mesh networks via serial port, BLE, or TCP/IP. The bot responds to messages containing configured keywords, executes commands, and provides various data services including weather, solar conditions, and satellite pass information. A web viewer provides a browser-based dashboard for monitoring and managing the bot.
 
+
+> [!CAUTION]
+> Before installing this bot, please take a moment to _truly_ consider if your mesh needs another bot. If there are already several bots on your mesh, it is likely that you are adding congestion without adding value.
+>
+> It is not recommended to run more than one bot on a single channel. Adding another bot to a channel already in use on your mesh may result in users unnecessarily receiving double responses, depleting mesh airtime for little additional value.
+>
+> If you decide to run the bot on your mesh, please take advantage of regions or hop limits to ensure that your bot is helping your neighbors not flooding the entire mesh.
+
 ## Features
 
 - **Connection Methods**: Serial port, BLE (Bluetooth Low Energy), or TCP/IP
 - **Keyword Responses**: Configurable keyword-response pairs with template variables
 - **Command System**: Plugin-based command architecture with built-in commands
-- **Command Aliases**: Define shorthand aliases for any command via `[Aliases]` config section
+- **Command Aliases**: Define shorthand aliases for any command via `aliases =` key in each command's config section
 - **Rate Limiting**: Global, per-user (by pubkey or name), and per-channel rate limits to prevent spam
 - **User Management**: Ban/unban users with persistent storage
 - **Scheduled Messages**: Send messages at configured times
@@ -28,11 +36,14 @@ A Python bot that connects to MeshCore mesh networks via serial port, BLE, or TC
 - **Packet Capture**: Capture and publish packets to MQTT brokers ([docs](docs/packet-capture.md))
 - **Map Uploader**: Upload node adverts to map.meshcore.dev ([docs](docs/map-uploader.md))
 - **Weather Service**: Scheduled forecasts, alerts, and lightning detection ([docs](docs/weather-service.md))
+- **Earthquake Service**: Scheduled USGS earthquake alerts for a configured region ([docs](docs/earthquake-service.md))
+- **Repeater Prefix Collision Service**: Detect and alert on repeater prefix collisions ([docs](docs/repeater-prefix-collision-service.md))
+- **MQTT Weather Relay**: Publish weather data from custom MQTT topics (configured via `MqttWeather` + `[Weather]`)
 - **Webhook Service**: Accept inbound HTTP POST payloads and relay to channels or DMs
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.10+
 - MeshCore-compatible device (Heltec V3, RAK Wireless, etc.)
 - USB cable or BLE capability
 
@@ -42,7 +53,7 @@ A Python bot that connects to MeshCore mesh networks via serial port, BLE, or TC
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
+git clone https://github.com/agessaman/meshcore-bot
 cd meshcore-bot
 ```
 
@@ -313,9 +324,17 @@ bot_name = MeshCoreBot            # Bot identification name
 enabled = true                    # Enable/disable bot
 rate_limit_seconds = 2            # Global: min seconds between any bot reply
 bot_tx_rate_limit_seconds = 1.0   # Min seconds between bot transmissions
-per_user_rate_limit_seconds = 5   # Per-user: min seconds between replies to same user (pubkey or name)
+per_user_rate_limit_seconds = 30  # Per-user: min seconds between replies to same user (pubkey or name)
 per_user_rate_limit_enabled = true
 startup_advert = flood            # Send advert on startup
+radio_probe_interval_seconds = 300   # probe interval in seconds (300–900 / 5–15 min)
+radio_probe_fail_threshold = 3       # consecutive failures before zombie is declared and logged
+send_timeout_seconds = 30            # max seconds to wait for a channel message send
+radio_zombie_alert_enabled = false   # send immediate alert email on zombie detection (default: log only)
+radio_zombie_alert_email =           # alert recipient(s); falls back to nightly email if blank
+radio_offline_threshold = 3          # consecutive send timeouts before radio-offline state is entered
+radio_offline_alert_enabled = true   # send alert email when radio-offline state is entered
+radio_offline_alert_email =          # alert recipient(s); falls back to nightly email if blank
 ```
 
 ### Keywords
@@ -348,12 +367,16 @@ channel.emergency_seconds = 0.0   # no rate limit on emergency channel
 ```
 
 ### Command Aliases
+
+Add an `aliases =` key to any command's config section. The value is a
+comma-separated list of extra keywords that trigger the same command.
+
 ```ini
-[Aliases]
-# Format: alias = target_command
-# Injects the alias string into the target command's keyword list.
-w = wx
-p = ping
+[Ping_Command]
+aliases = p,ping-test
+
+[WX_Command]
+aliases = w,weather
 ```
 
 ### Inbound Webhook
@@ -460,7 +483,7 @@ Or if installed as a package entry point:
 For a comprehensive list of all available commands with examples and detailed explanations, see [Command reference](docs/command-reference.md).
 
 Quick reference:
-- **Basic:** `test`, `ping`, `help`, `hello`, `cmd`
+ - **Basic:** `test`, `ping`, `version`, `help`, `hello`, `cmd`
 - **Information:** `wx`, `gwx`, `aqi`, `sun`, `moon`, `solar`, `solarforecast`, `hfcond`, `satpass`, `channels`
 - **Emergency:** `alert`
 - **Gaming:** `dice`, `roll`, `magic8`

@@ -66,10 +66,7 @@ class DadJokeCommand(BaseCommand):
         Returns:
             bool: True if message matches a keyword, False otherwise.
         """
-        content = message.content.strip()
-        if content.startswith('!'):
-            content = content[1:].strip()
-        content_lower = content.lower()
+        content_lower = self.cleanup_message_for_matching(message)
         return any(content_lower == keyword or content_lower.startswith(keyword + ' ') for keyword in self.keywords)
 
     def can_execute(self, message: MeshMessage, skip_channel_check: bool = False) -> bool:
@@ -127,7 +124,7 @@ class DadJokeCommand(BaseCommand):
         try:
             headers = {
                 'Accept': 'application/json',
-                'User-Agent': 'MeshCoreBot (https://github.com/adam/meshcore-bot)'
+                'User-Agent': 'MeshCoreBot (https://github.com/agessaman/meshcore-bot)'
             }
 
             self.logger.debug(f"Fetching dad joke from: {self.DAD_JOKE_API_URL}")

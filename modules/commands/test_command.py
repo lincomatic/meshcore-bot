@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from ..models import MeshMessage
+from ..response_template import format_piped_template
 from ..utils import calculate_distance, extract_path_node_ids_from_message
 from .base_command import BaseCommand
 
@@ -133,16 +134,25 @@ class TestCommand(BaseCommand):
 
         return False
 
+    DEFAULT_FORMAT = "ack @[{sender}]{phrase_part} | {connection_info} | Received at: {timestamp}"
+
     def get_response_format(self) -> Optional[str]:
-        """Get the response format from config.
+        """Get the response format from config, falling back to the built-in default.
 
         Returns:
-            Optional[str]: The configured response format string, or None if not set.
+            Optional[str]: The configured or default response format string.
         """
+        if self.bot.config.has_section('Test_Command'):
+            raw = self.bot.config.get('Test_Command', 'response_format', fallback='')
+            if raw:
+                cleaned = self._strip_quotes_from_config(raw).strip()
+                if cleaned:
+                    return cleaned
         if self.bot.config.has_section('Keywords'):
             format_str = self.bot.config.get('Keywords', 'test', fallback=None)
-            return self._strip_quotes_from_config(format_str) if format_str else None
-        return None
+            if format_str:
+                return self._strip_quotes_from_config(format_str)
+        return self.DEFAULT_FORMAT
 
     def _extract_path_node_ids(self, message: MeshMessage) -> list[str]:
         """Extract path node IDs from message. Prefers routing_info.path_nodes (multi-byte); else parses message.path.
@@ -680,19 +690,26 @@ class TestCommand(BaseCommand):
             path_distance = self._calculate_path_distance(message)
             firstlast_distance = self._calculate_firstlast_distance(message)
             phrase_part = f": {phrase}" if phrase else ""
-            return response_format.format(
-                sender=message.sender_id or self.translate('common.unknown_sender'),
-                phrase=phrase,
-                phrase_part=phrase_part,
-                connection_info=connection_info,
-                path=path_display,
-                hops=hops_str,
-                hops_label=hops_label,
-                timestamp=timestamp,
-                elapsed=elapsed,
-                snr=message.snr or self.translate('common.unknown'),
-                path_distance=path_distance or "",
-                firstlast_distance=firstlast_distance or ""
+            fields = {
+                'sender': message.sender_id or self.translate('common.unknown_sender'),
+                'phrase': phrase,
+                'phrase_part': phrase_part,
+                'connection_info': connection_info,
+                'path': path_display,
+                'hops': hops_str,
+                'hops_label': hops_label,
+                'timestamp': timestamp,
+                'elapsed': elapsed,
+                'snr': str(message.snr) if message.snr is not None else self.translate('common.unknown'),
+                'path_distance': path_distance or '',
+                'firstlast_distance': firstlast_distance or '',
+            }
+            return format_piped_template(
+                response_format,
+                fields,
+                message=message,
+                logger=self.logger,
+                prefix_hex_chars=getattr(self.bot, 'prefix_hex_chars', 2),
             )
         except (KeyError, ValueError) as e:
             self.logger.warning(f"Error formatting test response: {e}")
@@ -707,6 +724,9 @@ class TestCommand(BaseCommand):
         Returns:
             bool: True if execution was successful.
         """
+        if not await self.enforce_path_byte_requirement(message, 'Test_Command'):
+            return True
+
         # Store the current message for use in location lookups
         self._current_message = message
         return await self.handle_keyword_match(message)

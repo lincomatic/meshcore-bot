@@ -4,7 +4,7 @@ Get meshcore-bot running on your machine in a few minutes.
 
 ## Requirements
 
-- **Python 3.7+**
+- **Python 3.10+**
 - **MeshCore-compatible device** (Heltec V3, RAK Wireless, etc.)
 - **Connection**: USB cable, BLE, or TCP/IP to the device
 
@@ -15,12 +15,14 @@ Get meshcore-bot running on your machine in a few minutes.
    ```bash
    git clone https://github.com/agessaman/meshcore-bot.git
    cd meshcore-bot
-   pip install -r requirements.txt
+   make dev
    ```
 
 2. **Configure**
 
-   Copy an example config and edit with your connection and bot settings:
+   **Interactive (recommended):** `make config` — ncurses editor for `config.ini`.
+
+   Or copy an example config and edit with your connection and bot settings:
 
    - **Full config** (all commands and options):
      ```bash
@@ -36,8 +38,19 @@ Get meshcore-bot running on your machine in a few minutes.
 3. **Run**
 
    ```bash
-   python3 meshcore_bot.py
+   .venv/bin/python meshcore_bot.py
    ```
+
+## Inspect effective config safely
+
+Use these commands to inspect the resolved config with sensitive keys redacted:
+
+```bash
+.venv/bin/python meshcore_bot.py --show-config --config config.ini
+.venv/bin/python meshcore_bot.py --show-config-json --config config.ini
+```
+
+Also available in the web UI at `/admin/config`.
 
 ## Production deployment
 
@@ -78,5 +91,8 @@ meshcore-bot.url = "github:agessaman/meshcore-bot/";
 ## Next steps
 
 - **[Command Reference](command-reference.md)** — Full command reference (wx, aqi, sun, path, prefix, etc.)
+- **[Upgrade guide](upgrade.md)** — Migrating to v0.9 from older releases
+- **[Config validation](config-validation.md)** — Validate `config.ini` before first run
+- **[Data retention](data-retention.md)** — Database cleanup defaults
 - **[README](https://github.com/agessaman/meshcore-bot/blob/main/README.md)** — Features, keywords, configuration overview
 - **Guides** (sidebar) — Path command, repeater commands, feeds, weather service, Discord bridge, map uploader, packet capture

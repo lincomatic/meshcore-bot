@@ -32,7 +32,7 @@ def is_valid_timezone(tz_str: str) -> bool:
         except ZoneInfoNotFoundError:
             return False
     try:
-        import pytz  # type: ignore[import-untyped]
+        pytz = __import__("pytz")
         pytz.timezone(tz_str.strip())
         return True
     except Exception:
@@ -48,7 +48,7 @@ def get_config_timezone(config: Any, logger: Optional[Any] = None) -> tuple[Any,
     """
     timezone_str = (config.get('Bot', 'timezone', fallback='') or '').strip()
     if timezone_str and is_valid_timezone(timezone_str):
-        import pytz
+        pytz = __import__("pytz")
         return (pytz.timezone(timezone_str), timezone_str)
     if timezone_str and logger:
         logger.warning("Invalid timezone '%s', using system timezone", timezone_str)
@@ -389,30 +389,29 @@ def get_major_city_queries(city: str, state_abbr: Optional[str] = None) -> list[
     return []
 
 
-def decode_path_len_byte(path_len_byte: int, max_path_size: int = 64) -> tuple:
-    """Decode the RF packet path_len byte per firmware (Packet.cpp).
+def decode_path_len_byte(path_len_byte: int, max_path_size: int = 64) -> tuple[int, int] | None:
+    """Decode the RF packet path_len byte per firmware ``Packet::isValidPathLen``.
 
     Encoding: low 6 bits = hop count, high 2 bits = size code.
-    bytes_per_hop = (path_len >> 6) + 1 → 1, 2, 3, or 4 (4 is reserved and invalid).
+    ``bytes_per_hop = (path_len >> 6) + 1`` → 1, 2, 3, or 4 (4 is reserved and invalid).
 
     Args:
         path_len_byte: The single path_len byte from the packet.
-        max_path_size: Max path bytes (default 64, matches MAX_PATH_SIZE).
+        max_path_size: Max path bytes (default 64, matches ``MAX_PATH_SIZE``).
 
     Returns:
-        Tuple of (path_byte_length, bytes_per_hop). If encoding is invalid
-        (hash_size==4 or hop_count*bytes_per_hop > max_path_size), returns
-        (path_len_byte, 1) for legacy: path_len is raw byte count, 1 byte per hop.
+        ``(path_byte_length, bytes_per_hop)`` if the encoding is valid on the wire.
+        ``None`` if reserved size class (4) or ``hop_count * bytes_per_hop > max_path_size``
+        — matching MeshCore where ``readFrom`` rejects the packet (no legacy reinterpretation).
     """
     hop_count = path_len_byte & 63
     size_code = path_len_byte >> 6
     bytes_per_hop = size_code + 1  # 1, 2, 3, or 4
     if bytes_per_hop == 4:
-        # Reserved in firmware, invalid
-        return (path_len_byte, 1)
+        return None
     path_byte_length = hop_count * bytes_per_hop
     if path_byte_length > max_path_size:
-        return (path_len_byte, 1)
+        return None
     return (path_byte_length, bytes_per_hop)
 
 
@@ -505,7 +504,10 @@ def calculate_packet_hash(raw_hex: str, payload_type: Optional[int] = None) -> s
 
         path_len_byte = byte_data[offset]
         offset += 1
-        path_byte_length, _ = decode_path_len_byte(path_len_byte)
+        path_parts = decode_path_len_byte(path_len_byte)
+        if path_parts is None:
+            return "0000000000000000"
+        path_byte_length, _ = path_parts
 
         # Validate we have enough bytes for the path
         if len(byte_data) < offset + path_byte_length:
@@ -529,9 +531,8 @@ def calculate_packet_hash(raw_hex: str, payload_type: Optional[int] = None) -> s
 
         if payload_type == 9:  # PAYLOAD_TYPE_TRACE
             # C++ does: sha.update(&path_len, sizeof(path_len))
-            # path_len is uint16_t, so sizeof(path_len) = 2 bytes
-            # Convert path_len to 2-byte little-endian uint16_t
-            hash_obj.update(path_byte_length.to_bytes(2, byteorder='little'))
+            # path_len is the raw wire byte (uint16_t in firmware), not the decoded byte count
+            hash_obj.update(path_len_byte.to_bytes(2, byteorder='little'))
 
         hash_obj.update(payload_data)
 
@@ -540,6 +541,26 @@ def calculate_packet_hash(raw_hex: str, payload_type: Optional[int] = None) -> s
     except Exception:
         # Return default hash on error (caller should handle logging)
         return "0000000000000000"
+
+
+def verify_meshcore_advert_ed25519(mesh_payload: bytes) -> bool:
+    """Verify MeshCore ADVERT Ed25519 signature (layout from ``Mesh::createAdvert``).
+
+    Signed message is ``pub_key (32) + timestamp (4, LE) + app_data``; signature is
+    ``payload[36:100]`` (64 bytes); ``app_data`` starts at byte 100.
+    """
+    if len(mesh_payload) < 100:
+        return False
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        pub = mesh_payload[:32]
+        msg = mesh_payload[:36] + mesh_payload[100:]
+        sig = mesh_payload[36:100]
+        Ed25519PublicKey.from_public_bytes(pub).verify(sig, msg)
+        return True
+    except Exception:
+        return False
 
 
 def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -1795,6 +1816,55 @@ def extract_path_node_ids_from_message(message: Any) -> list[str]:
         ):
             return [p.upper() for p in parts]
     return []
+
+
+def _normalized_message_path_string(message: Any) -> str:
+    """Strip route suffix and hop-count suffix from message.path for continuous-hex parsing."""
+    path_string = (getattr(message, 'path', None) or '').strip()
+    if not path_string or 'Direct' in path_string or '0 hops' in path_string:
+        return ''
+    if ' via ROUTE_TYPE_' in path_string:
+        path_string = path_string.split(' via ROUTE_TYPE_')[0]
+    path_string = re.sub(r'\s*\([^)]*hops?[^)]*\)', '', path_string, flags=re.IGNORECASE).strip()
+    return path_string
+
+
+def bytes_per_hop_from_routing_and_nodes(
+    routing_info: Optional[dict[str, Any]],
+    node_ids: list[str],
+) -> int:
+    """Bytes per hop from packet routing metadata, else inferred from hex node width.
+
+    When ``routing_info`` includes ``bytes_per_hop`` in 1..3, that value wins.
+    Otherwise uses minimum half-byte width among ``node_ids`` (comma or path_nodes).
+    Returns ``1`` when no nodes (direct / unknown).
+    """
+    if routing_info:
+        bph = routing_info.get('bytes_per_hop')
+        if isinstance(bph, int) and 1 <= bph <= 3:
+            return bph
+    if node_ids:
+        return min(len(n) // 2 for n in node_ids)
+    return 1
+
+
+def message_path_bytes_per_hop(message: Any, *, prefix_hex_chars: int = 2) -> int:
+    """Best-effort bytes per hop for the message path (RF metadata or inferred from path text).
+
+    Uses ``routing_info.bytes_per_hop`` when present (1..3). Otherwise prefers
+    :func:`extract_path_node_ids_from_message`, then comma/continuous hex via
+    :func:`node_ids_from_path_string` using ``prefix_hex_chars`` for legacy paths.
+
+    Returns ``1`` when no usable path (direct / unparseable) so conservative gates
+    (e.g. ``pathbytes_min:2``) do not treat unknown as multibyte.
+    """
+    routing_info = getattr(message, 'routing_info', None)
+    node_ids = extract_path_node_ids_from_message(message)
+    if not node_ids:
+        ps = _normalized_message_path_string(message)
+        if ps:
+            node_ids = node_ids_from_path_string(ps, prefix_hex_chars)
+    return bytes_per_hop_from_routing_and_nodes(routing_info, node_ids)
 
 
 def node_ids_from_path_string(path_str: str, prefix_hex_chars: int = 2) -> list[str]:

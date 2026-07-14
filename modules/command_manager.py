@@ -8,14 +8,22 @@ import asyncio
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from datetime import datetime
+from hashlib import sha256
+from typing import Any
 
 from meshcore import EventType
 
 from .commands.base_command import BaseCommand
-from .config_validation import strip_optional_quotes
-from .models import MeshMessage
+from .config_validation import (
+    PUBLIC_CHANNEL_KEY_HEX,  # noqa: F401 — re-exported; used by core.py
+    PUBLIC_CHANNEL_OVERRIDE_KEY,
+    _channel_name_is_public,
+    strip_optional_quotes,
+)
+from .models import CHANNEL_REGIONAL_FLOOD_SCOPE_BODY_OVERHEAD, MeshMessage
 from .plugin_loader import PluginLoader
+from .security_utils import sanitize_name, validate_safe_path
 from .utils import check_internet_connectivity_async, decode_escape_sequences, format_keyword_response_with_placeholders
 
 
@@ -30,7 +38,7 @@ class InternetStatusCache:
     """
     has_internet: bool
     timestamp: float
-    _lock: Optional[asyncio.Lock] = None
+    _lock: asyncio.Lock | None = None
 
     def _get_lock(self) -> asyncio.Lock:
         """Lazily initialize the async lock.
@@ -103,9 +111,96 @@ class CommandManager:
         # Command queue for near-expiring global cooldowns
         # Key: (command_name, user_id) tuple, Value: QueuedCommand
         self._command_queue: dict[tuple[str, str], QueuedCommand] = {}
-        self._queue_processor_task: Optional[asyncio.Task] = None
+        self._queue_processor_task: asyncio.Task | None = None
+
+        # Multi-scope reply: map of normalized scope name → 16-byte HMAC key.
+        # flood_scope_allow_global is True when '*' (or equivalent) appears in
+        # flood_scopes, meaning unscoped FLOOD messages are also permitted.
+        self.flood_scope_allow_global: bool = False
+        self.flood_scope_keys: dict[str, bytes] = self._load_flood_scope_keys()
 
         self.logger.info(f"CommandManager initialized with {len(self.commands)} plugins")
+
+    def _flood_scopes_config_raw(self) -> str:
+        """Raw flood_scopes value; [Channels] is canonical, [Bot] accepted with a warning."""
+        for section in ("Channels", "Bot"):
+            if self.bot.config.has_section(section) and self.bot.config.has_option(
+                section, "flood_scopes"
+            ):
+                raw = (self.bot.config.get(section, "flood_scopes") or "").strip()
+                if not raw:
+                    continue
+                if section != "Channels":
+                    self.logger.warning(
+                        "flood_scopes is set in [Bot]; move it to [Channels] "
+                        "(still loaded for this run)"
+                    )
+                return raw
+        return ""
+
+    def _load_flood_scope_keys(self) -> dict[str, bytes]:
+        """Load flood_scopes config into a name→16-byte-key dict for HMAC matching.
+
+        Global/wildcard entries ('*', '', '0', 'None') are not added to the key
+        dict (they have no HMAC) but set flood_scope_allow_global so unscoped
+        FLOOD messages are still permitted through the allowlist check.
+        """
+        scope_keys: dict[str, bytes] = {}
+        raw = self._flood_scopes_config_raw()
+        if not raw:
+            return scope_keys
+        for entry in (s.strip() for s in raw.split(",") if s.strip()):
+            normalized = self._normalize_scope_name(entry)
+            if normalized in ("", "*", "0", "None"):
+                self.flood_scope_allow_global = True
+            elif normalized:
+                scope_keys[normalized] = sha256(normalized.encode()).digest()[:16]
+        if scope_keys or self.flood_scope_allow_global:
+            self.logger.info(
+                f"Flood scope allowlist active: {list(scope_keys.keys())} "
+                f"(global/unscoped permitted: {self.flood_scope_allow_global})"
+            )
+        return scope_keys
+
+    @staticmethod
+    def _normalize_scope_name(scope: str) -> str:
+        """Return scope with '#' prepended if it is a non-global named region without one."""
+        if scope in ("", "*", "0", "None"):
+            return scope
+        if not scope.startswith("#"):
+            return "#" + scope
+        return scope
+
+    def _outgoing_flood_scope_override(self) -> str:
+        """[Channels] outgoing_flood_scope_override when set, else empty string."""
+        if self.bot.config.has_section("Channels") and self.bot.config.has_option(
+            "Channels", "outgoing_flood_scope_override"
+        ):
+            return (self.bot.config.get("Channels", "outgoing_flood_scope_override") or "").strip()
+        return ""
+
+    def resolve_channel_send_scope(
+        self,
+        *,
+        scope: str | None = None,
+        message: MeshMessage | None = None,
+        config_section: str | None = None,
+    ) -> str | None:
+        """Resolve explicit regional scope before send_channel_message applies override.
+
+        Precedence: explicit ``scope`` arg → ``message.reply_scope`` (mirror incoming) →
+        ``flood_scope`` in ``config_section``. Returns ``None`` when unset so
+        ``send_channel_message`` falls back to ``outgoing_flood_scope_override``.
+        """
+        if scope is not None:
+            return scope
+        if message is not None and message.reply_scope is not None:
+            return message.reply_scope
+        if config_section and self.bot.config.has_section(config_section):
+            raw = (self.bot.config.get(config_section, "flood_scope", fallback="") or "").strip()
+            if raw:
+                return self._normalize_scope_name(raw)
+        return None
 
     def _should_queue_command(self, command: BaseCommand, message: MeshMessage) -> tuple[bool, float]:
         """Check if command should be queued instead of rejected.
@@ -259,11 +354,11 @@ class CommandManager:
             self.logger.debug(f"Applying {self.bot.tx_delay_ms}ms transmission delay")
             await asyncio.sleep(self.bot.tx_delay_ms / 1000.0)
 
-    def get_rate_limit_key(self, message: MeshMessage) -> Optional[str]:
+    def get_rate_limit_key(self, message: MeshMessage) -> str | None:
         """Return the key used for per-user rate limiting (pubkey when available, else sender name)."""
         return message.sender_pubkey or message.sender_id or None
 
-    def get_rate_limit_wait_seconds(self, rate_limit_key: Optional[str] = None) -> float:
+    def get_rate_limit_wait_seconds(self, rate_limit_key: str | None = None) -> float:
         """Return seconds to wait until we could pass rate limits (for reply retry)."""
         wait = 0.0
         if not self.bot.rate_limiter.can_send():
@@ -275,8 +370,8 @@ class CommandManager:
         return wait
 
     async def _check_rate_limits(
-        self, skip_user_rate_limit: bool = False, rate_limit_key: Optional[str] = None,
-        channel: Optional[str] = None,
+        self, skip_user_rate_limit: bool = False, rate_limit_key: str | None = None,
+        channel: str | None = None,
     ) -> tuple[bool, str]:
         """Check all rate limits before sending.
 
@@ -300,7 +395,8 @@ class CommandManager:
                 if wait_time > 0.1:
                     return False, f"Rate limited. Wait {wait_time:.1f} seconds"
                 return False, ""
-            # Per-user rate limit when enabled and key present
+            # Per-user rate limit when enabled and key present.
+            # Admin ACL controls command authorization only; it does not bypass send rate limits.
             if getattr(self.bot, 'per_user_rate_limit_enabled', False) and rate_limit_key:
                 per_user = getattr(self.bot, 'per_user_rate_limiter', None)
                 if per_user and not per_user.can_send(rate_limit_key):
@@ -341,7 +437,7 @@ class CommandManager:
         operation_name: str,
         target: str,
         used_retry_method: bool = False,
-        rate_limit_key: Optional[str] = None,
+        rate_limit_key: str | None = None,
     ) -> bool:
         """Handle result from message send operations.
 
@@ -449,7 +545,7 @@ class CommandManager:
         banned = self.bot.config.get('Banned_Users', 'banned_users', fallback='')
         return [user.strip() for user in banned.split(',') if user.strip()]
 
-    def is_user_banned(self, sender_id: Optional[str]) -> bool:
+    def is_user_banned(self, sender_id: str | None) -> bool:
         """Check if sender is banned using prefix (starts-with) matching.
 
         A banned entry "Awful Username" matches "Awful Username" and "Awful Username 🍆".
@@ -464,9 +560,21 @@ class CommandManager:
         """
         raw = self.bot.config.get('Channels', 'monitor_channels', fallback='')
         channels = strip_optional_quotes(raw)
-        return [channel.strip() for channel in channels.split(',') if channel.strip()]
+        channel_list = [channel.strip() for channel in channels.split(',') if channel.strip()]
 
-    def load_channel_keywords(self) -> Optional[list[str]]:
+        if any(_channel_name_is_public(ch) for ch in channel_list):
+            override = self.bot.config.get("Bot", PUBLIC_CHANNEL_OVERRIDE_KEY, fallback="").strip().lower()
+            if override != "true":
+                self.logger.error(
+                    "FATAL: monitor_channels includes the Public channel. Running a bot on "
+                    "Public is disruptive to other mesh users. To override, add to [Bot]:\n"
+                    f"  {PUBLIC_CHANNEL_OVERRIDE_KEY} = true"
+                )
+                raise SystemExit(1)
+
+        return channel_list
+
+    def load_channel_keywords(self) -> list[str] | None:
         """Load channel keyword whitelist from config.
 
         When set, only these triggers (command/keyword names) are answered in channels;
@@ -517,6 +625,9 @@ class CommandManager:
     def get_max_message_length(self, message: MeshMessage) -> int:
         """Return max message body size in UTF-8 bytes (DM=158, channel per firmware budget).
 
+        Regional (non-global) flood scope reduces the channel body budget by
+        ``CHANNEL_REGIONAL_FLOOD_SCOPE_BODY_OVERHEAD`` bytes.
+
         Mirrors ``BaseCommand.get_max_message_length`` but works on the manager level so it
         can be called outside of a specific command instance.
         """
@@ -535,8 +646,10 @@ class CommandManager:
             pass
         if not username:
             username = self.bot.config.get('Bot', 'bot_name', fallback='Bot')
-        max_length = 160 - len(str(username).encode('utf-8')) - 2
-        return max(130, max_length)
+        max_length = max(130, 160 - len(str(username).encode('utf-8')) - 2)
+        if not MeshMessage.is_global_flood_scope(message.effective_outgoing_flood_scope(self.bot)):
+            max_length -= CHANNEL_REGIONAL_FLOOD_SCOPE_BODY_OVERHEAD
+        return max_length
 
     def check_keywords(self, message: MeshMessage) -> list[tuple]:
         """Check message content for keywords and return matching responses.
@@ -550,7 +663,7 @@ class CommandManager:
         Returns:
             List[tuple]: List of (trigger, response) tuples for matched keywords.
         """
-        matches: list[tuple[str, Optional[str]]] = []
+        matches: list[tuple[str, str | None]] = []
         content = message.content.strip()
 
         # Check for command prefix if configured
@@ -713,7 +826,7 @@ class CommandManager:
         # case-insensitive + ignore extra spaces
         return " ".join(text.lower().split())
 
-    def match_randomline(self, message: MeshMessage) -> Optional[tuple[str, str]]:
+    def match_randomline(self, message: MeshMessage) -> tuple[str, str] | None:
         """
         Exact-match message content against RandomLine triggers.
         Returns (key, response) or None.
@@ -793,6 +906,15 @@ class CommandManager:
             self.logger.warning(f"RandomLine matched '{key}' but missing config file.{key}")
             return None
 
+        try:
+            validated_path = validate_safe_path(file_path, allow_absolute=True)
+        except ValueError:
+            validated_path = None
+        if validated_path is None:
+            self.logger.warning(f"RandomLine: unsafe or restricted path rejected for '{key}': {file_path}")
+            return None
+        file_path = str(validated_path)
+
         # Read usable lines
         try:
             with open(file_path, encoding="utf-8") as f:
@@ -845,9 +967,9 @@ class CommandManager:
         self,
         recipient_id: str,
         content: str,
-        command_id: Optional[str] = None,
+        command_id: str | None = None,
         skip_user_rate_limit: bool = False,
-        rate_limit_key: Optional[str] = None,
+        rate_limit_key: str | None = None,
     ) -> bool:
         """Send a direct message using meshcore-cli command.
 
@@ -866,6 +988,13 @@ class CommandManager:
         if not self.bot.connected or not self.bot.meshcore:
             return False
 
+        if self.bot.is_radio_zombie:
+            self.bot.logger.warning("send_dm suppressed — radio is in zombie state; power cycle required")
+            return False
+        if self.bot.is_radio_offline:
+            self.bot.logger.warning("send_dm suppressed — radio is offline (repeated send timeouts)")
+            return False
+
         # Check all rate limits
         can_send, reason = await self._check_rate_limits(
             skip_user_rate_limit=skip_user_rate_limit, rate_limit_key=rate_limit_key
@@ -876,15 +1005,42 @@ class CommandManager:
             return False
 
         try:
-            # Find the contact by name (since recipient_id is the contact name)
+            # Name lookup first (backward compatible), then fallback to pubkey/prefix.
             contact = self.bot.meshcore.get_contact_by_name(recipient_id)
+            lookup_type = "name"
+            if not contact and hasattr(self.bot.meshcore, "contacts"):
+                recipient_key = (recipient_id or "").strip()
+                contacts = self.bot.meshcore.contacts or {}
+                for contact_data in contacts.values():
+                    public_key = (contact_data.get("public_key", "") or "").strip()
+                    if not public_key:
+                        continue
+                    if public_key == recipient_key or public_key.startswith(recipient_key):
+                        contact = contact_data
+                        lookup_type = "pubkey_prefix"
+                        self.logger.debug(
+                            "Resolved DM recipient '%s' via public key prefix lookup",
+                            sanitize_name(recipient_key),
+                        )
+                        break
+
             if not contact:
-                self.logger.error(f"Contact not found for name: {recipient_id}")
+                self.logger.error(
+                    "Contact not found for DM recipient identifier: %s",
+                    sanitize_name(recipient_id),
+                )
                 return False
 
             # Use the contact name for logging
             contact_name = contact.get('name', contact.get('adv_name', recipient_id))
-            self.logger.info(f"Sending DM to {contact_name}: {content}")
+            if lookup_type != "name":
+                self.logger.info(
+                    "Sending DM to %s (resolved via %s)",
+                    sanitize_name(contact_name),
+                    lookup_type,
+                )
+            else:
+                self.logger.info("Sending DM to %s", sanitize_name(contact_name))
 
             # Record transmission for repeat tracking (don't let this block sending)
             try:
@@ -949,18 +1105,29 @@ class CommandManager:
         self,
         channel: str,
         content: str,
-        command_id: Optional[str] = None,
+        command_id: str | None = None,
         skip_user_rate_limit: bool = False,
-        rate_limit_key: Optional[str] = None,
-        scope: Optional[str] = None,
+        rate_limit_key: str | None = None,
+        scope: str | None = None,
+        timestamp: datetime | None = None,
     ) -> bool:
         """Send a channel message using meshcore_py (optional flood scope).
 
         Resolves channel names to numbers and handles rate limiting.
-        If [Channels] flood_scope is set (or scope is passed), uses that scope
-        for this send then restores global flood. Scope values "" / "*" / "0" mean global.
+        If [Channels] outgoing_flood_scope_override is set (or scope is passed explicitly),
+        uses that scope for this send then restores global flood. When neither is set,
+        scope defaults to global flood. Scope values "" / "*" / "0" mean global.
         """
         if not self.bot.connected or not self.bot.meshcore:
+            return False
+
+        if self.bot.is_radio_zombie:
+            self.bot.logger.warning("send_channel_message suppressed — radio is in zombie state; power cycle required")
+            return False
+        if self.bot.is_radio_offline:
+            self.bot.logger.warning(
+                "send_channel_message suppressed — radio is offline (repeated send timeouts)"
+            )
             return False
 
         # Check all rate limits (including per-channel)
@@ -1000,23 +1167,67 @@ class CommandManager:
                 # Don't fail the send if transmission tracking fails
 
             # Optional flood scope (region): set before send, restore after
-            scope_cfg = ""
-            if self.bot.config.has_section("Channels") and self.bot.config.has_option("Channels", "flood_scope"):
-                scope_cfg = (self.bot.config.get("Channels", "flood_scope") or "").strip()
-            scope_to_use = (scope if scope is not None else scope_cfg) or ""
+            resolved = self.resolve_channel_send_scope(scope=scope)
+            scope_to_use = (
+                resolved if resolved is not None else self._outgoing_flood_scope_override()
+            ) or ""
             scope_is_global = scope_to_use in ("", "*", "0", "None")
-            if not scope_is_global and hasattr(self.bot.meshcore.commands, "set_flood_scope"):
-                await self.bot.meshcore.commands.set_flood_scope(scope_to_use)
+            if not scope_is_global:
+                scope_to_use = self._normalize_scope_name(scope_to_use)
+            override_cfg = self._outgoing_flood_scope_override()
+            if scope_is_global:
+                if override_cfg:
+                    self.logger.warning(
+                        "Outbound channel flood scope: global (no set_flood_scope); "
+                        "outgoing_flood_scope_override=%r was not applied "
+                        "(explicit scope=%r)",
+                        override_cfg,
+                        scope,
+                    )
+                else:
+                    self.logger.debug("Outbound channel flood scope: global (no set_flood_scope)")
+            else:
+                scope_source = "explicit argument" if scope is not None else (
+                    "outgoing_flood_scope_override"
+                    if resolved is None and override_cfg
+                    else "reply_scope or config"
+                )
+                self.logger.info(
+                    "Outbound channel flood scope: %s (%s; set_flood_scope)",
+                    scope_to_use,
+                    scope_source,
+                )
+            if not scope_is_global and not hasattr(self.bot.meshcore.commands, "set_flood_scope"):
+                self.logger.warning(
+                    "Regional flood scope %r requested but meshcore.commands.set_flood_scope "
+                    "is unavailable; channel message will use device default (often global flood)",
+                    scope_to_use,
+                )
+            elif not scope_is_global:
+                _scope_result = await self.bot.meshcore.commands.set_flood_scope(scope_to_use)
+                if _scope_result is None or getattr(_scope_result, "type", None) == "ERROR":
+                    self.logger.warning(
+                        "set_flood_scope(%s) failed (result=%s); "
+                        "message will be sent with current firmware scope",
+                        scope_to_use, _scope_result,
+                    )
 
             target = f"{channel} (channel {channel_num})"
             # Retry on no_event_received: max 2 extra attempts, 2s apart
             _max_retries = 2
             for _attempt in range(_max_retries + 1):
                 try:
-                    result = await self.bot.meshcore.commands.send_chan_msg(channel_num, content)
+                    result = await self.bot.meshcore.commands.send_chan_msg(
+                        channel_num, content,
+                        timestamp=int(timestamp.timestamp()) if timestamp else None,
+                    )
                 finally:
                     if not scope_is_global and hasattr(self.bot.meshcore.commands, "set_flood_scope"):
-                        await self.bot.meshcore.commands.set_flood_scope("*")
+                        _restore_result = await self.bot.meshcore.commands.set_flood_scope("*")
+                        if _restore_result is None or getattr(_restore_result, "type", None) == "ERROR":
+                            self.logger.warning(
+                                "set_flood_scope('*') restore failed (result=%s)", _restore_result
+                            )
 
                 if self._is_no_event_received(result) and _attempt < _max_retries:
                     self.logger.warning(
@@ -1026,7 +1237,12 @@ class CommandManager:
                     await asyncio.sleep(2)
                     # Re-apply scope for next attempt
                     if not scope_is_global and hasattr(self.bot.meshcore.commands, "set_flood_scope"):
-                        await self.bot.meshcore.commands.set_flood_scope(scope_to_use)
+                        _scope_result = await self.bot.meshcore.commands.set_flood_scope(scope_to_use)
+                        if _scope_result is None or getattr(_scope_result, "type", None) == "ERROR":
+                            self.logger.warning(
+                                "set_flood_scope(%s) failed on retry re-apply (result=%s)",
+                                scope_to_use, _scope_result,
+                            )
                     continue
                 break
 
@@ -1062,10 +1278,10 @@ class CommandManager:
         channel: str,
         chunks: list[str],
         *,
-        command_id: Optional[str] = None,
+        command_id: str | None = None,
         skip_user_rate_limit: bool = True,
-        rate_limit_key: Optional[str] = None,
-        scope: Optional[str] = None,
+        rate_limit_key: str | None = None,
+        scope: str | None = None,
     ) -> bool:
         """Send multiple channel messages with rate-limit spacing between chunks.
 
@@ -1110,7 +1326,7 @@ class CommandManager:
                 return False
         return True
 
-    def get_help_for_command(self, command_name: str, message: Optional[MeshMessage] = None) -> str:
+    def get_help_for_command(self, command_name: str, message: MeshMessage | None = None) -> str:
         """Get help text for a specific command (LoRa-friendly compact format).
 
         Args:
@@ -1143,7 +1359,7 @@ class CommandManager:
             return f"Help {command_name}: {help_text}"
 
         # Next, consult plugin_loader keyword mappings (if available)
-        mapped_name: Optional[str] = None
+        mapped_name: str | None = None
         if hasattr(self, 'plugin_loader') and hasattr(self.plugin_loader, 'keyword_mappings'):
             mapped_name = self.plugin_loader.keyword_mappings.get(normalized_name)
         if mapped_name:
@@ -1200,7 +1416,7 @@ class CommandManager:
     _HELP_PREFIX = "Bot Help: "
     _HELP_SUFFIX = " | More: 'help <command>'"
 
-    def get_general_help(self, message: Optional[MeshMessage] = None) -> str:
+    def get_general_help(self, message: MeshMessage | None = None) -> str:
         """Get general help text from config (LoRa-friendly compact format).
 
         When message is provided, only lists commands valid for the message's channel.
@@ -1298,7 +1514,14 @@ class CommandManager:
 
         return commands_list
 
-    async def send_response(self, message: MeshMessage, content: str, skip_user_rate_limit: bool = False) -> bool:
+    async def send_response(
+        self,
+        message: MeshMessage,
+        content: str,
+        skip_user_rate_limit: bool = False,
+        *,
+        command_id: str | None = None,
+    ) -> bool:
         """Unified method for sending responses to users.
 
         Automatically determines whether to send a DM or channel message based
@@ -1308,6 +1531,7 @@ class CommandManager:
             message: The original message being responded to.
             content: The response content.
             skip_user_rate_limit: If True, skip the user rate limiter check (for automated responses).
+            command_id: Optional id for repeat/transmission tracking (e.g. keyword or RandomLine flows).
 
         Returns:
             bool: True if response was sent successfully, False otherwise.
@@ -1322,15 +1546,20 @@ class CommandManager:
             rate_limit_key = self.get_rate_limit_key(message)
             if message.is_dm:
                 return await self.send_dm(
-                    message.sender_id or "", content,
+                    message.sender_pubkey or message.sender_id or "",
+                    content,
+                    command_id,
                     skip_user_rate_limit=skip_user_rate_limit,
                     rate_limit_key=rate_limit_key,
                 )
             else:
                 return await self.send_channel_message(
-                    message.channel or "", content,
+                    message.channel or "",
+                    content,
+                    command_id,
                     skip_user_rate_limit=skip_user_rate_limit,
                     rate_limit_key=rate_limit_key,
+                    scope=getattr(message, 'reply_scope', None),
                 )
         except Exception as e:
             self.logger.error(f"Failed to send response: {e}")
@@ -1397,7 +1626,7 @@ class CommandManager:
                     await asyncio.sleep(sleep_time)
                 skip = skip_user_rate_limit_first if i == 0 else True
                 success = await self.send_dm(
-                    message.sender_id or "",
+                    message.sender_pubkey or message.sender_id or "",
                     chunk,
                     skip_user_rate_limit=skip,
                     rate_limit_key=rate_limit_key,
@@ -1414,6 +1643,7 @@ class CommandManager:
             chunks,
             skip_user_rate_limit=skip_user_rate_limit_first,
             rate_limit_key=rate_limit_key,
+            scope=getattr(message, 'reply_scope', None),
         )
 
     async def execute_commands(self, message):
@@ -1686,11 +1916,11 @@ class CommandManager:
 
             return has_internet
 
-    def get_plugin_by_keyword(self, keyword: str) -> Optional[BaseCommand]:
+    def get_plugin_by_keyword(self, keyword: str) -> BaseCommand | None:
         """Get a plugin by keyword"""
         return self.plugin_loader.get_plugin_by_keyword(keyword)
 
-    def get_plugin_by_name(self, name: str) -> Optional[BaseCommand]:
+    def get_plugin_by_name(self, name: str) -> BaseCommand | None:
         """Get a plugin by name"""
         return self.plugin_loader.get_plugin_by_name(name)
 
@@ -1698,6 +1928,6 @@ class CommandManager:
         """Reload a specific plugin"""
         return self.plugin_loader.reload_plugin(plugin_name)
 
-    def get_plugin_metadata(self, plugin_name: Optional[str] = None) -> dict[str, Any]:
+    def get_plugin_metadata(self, plugin_name: str | None = None) -> dict[str, Any]:
         """Get plugin metadata"""
         return self.plugin_loader.get_plugin_metadata(plugin_name)

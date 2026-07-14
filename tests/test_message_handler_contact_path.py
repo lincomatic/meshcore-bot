@@ -3,8 +3,10 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from meshcore import EventType
 
 from modules.message_handler import MessageHandler
+from modules.repeater_manager import RepeaterManager, TrackAdvertResult
 
 
 def _make_config_get():
@@ -31,11 +33,20 @@ def message_handler():
 
 @pytest.fixture
 def companion_new_contact_setup():
-    """Bot + MessageHandler wired for companion NEW_CONTACT → add_contact."""
+    """Bot + MessageHandler wired for companion NEW_CONTACT → add_contact (bot auto-manage)."""
     bot = MagicMock()
     bot.logger = MagicMock()
+
+    def _config_get(section, key, **kw):
+        defaults = {
+            ("Bot", "rf_data_timeout"): "15.0",
+            ("Bot", "message_correlation_timeout"): "10.0",
+            ("Bot", "auto_manage_contacts"): "bot",
+        }
+        return defaults.get((section, key), kw.get("fallback", ""))
+
     bot.config = MagicMock()
-    bot.config.get = MagicMock(side_effect=_make_config_get())
+    bot.config.get = MagicMock(side_effect=_config_get)
     bot.config.getboolean = MagicMock(return_value=True)
     bot.prefix_hex_chars = 8
 
@@ -43,14 +54,28 @@ def companion_new_contact_setup():
     bot.message_handler = mh
 
     rm = MagicMock()
+    rm.bot = bot
+    rm.logger = bot.logger
     rm._is_repeater_device = MagicMock(return_value=False)
-    rm.track_contact_advertisement = AsyncMock()
+    rm.track_contact_advertisement = AsyncMock(
+        return_value=TrackAdvertResult(ok=True, duplicate_packet=False)
+    )
     rm.check_and_auto_purge = AsyncMock()
+    rm.get_contact_list_status = AsyncMock(
+        return_value={"is_near_limit": False, "usage_percentage": 0.0}
+    )
+    rm.manage_contact_list = AsyncMock()
+    rm.db_manager = MagicMock()
+    rm.db_manager.execute_update = MagicMock()
+
+    async def _add_companion(contact_data, contact_name, public_key):
+        return await RepeaterManager.add_companion_from_contact_data(rm, contact_data, contact_name, public_key)
+
+    rm.add_companion_from_contact_data = AsyncMock(side_effect=_add_companion)
     bot.repeater_manager = rm
 
     ok = MagicMock()
-    ok.type = MagicMock()
-    ok.type.name = "OK"
+    ok.type = EventType.OK
     bot.meshcore = MagicMock()
     bot.meshcore.commands = MagicMock()
     bot.meshcore.commands.add_contact = AsyncMock(return_value=ok)
@@ -94,6 +119,17 @@ class TestEnsureContactMeshcorePathEncoding:
         assert c["out_path_hash_mode"] == 1
         assert c["out_path_len"] == 3
         assert (c["out_path_len"] | (c["out_path_hash_mode"] << 6)) == 0x43
+
+    def test_fixes_when_hash_mode_is_string_and_out_path_len_missing(self, message_handler):
+        c = {
+            "out_path_hash_mode": "-1",
+            "out_path": "01020304",
+            "out_bytes_per_hop": 1,
+        }
+        message_handler._ensure_contact_meshcore_path_encoding(c)
+        assert c["out_path_hash_mode"] == 0
+        assert c["out_path_len"] == 4
+        assert (c["out_path_len"] | (c["out_path_hash_mode"] << 6)) == 0x04
 
 
 class TestHandleNewContactAddContact:

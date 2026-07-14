@@ -4,9 +4,11 @@ import datetime
 import time
 from configparser import ConfigParser
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
+from modules.scheduled_message_cron import parse_schedule_key
 from modules.scheduler import MessageScheduler
 
 
@@ -17,7 +19,38 @@ def scheduler(mock_logger):
     bot.logger = mock_logger
     bot.config = ConfigParser()
     bot.config.add_section("Bot")
+    bot.config.set("Bot", "scheduled_message_max_stagger_seconds", "0")
     return MessageScheduler(bot)
+
+
+class TestParseScheduleKey:
+    """Tests for scheduled message cron / preset / legacy parsing."""
+
+    def test_five_field_cron(self):
+        tz = ZoneInfo("UTC")
+        r = parse_schedule_key("30 14 * * *", tz)
+        assert r.trigger is not None
+        assert r.display_label == "30 14 * * *"
+        assert r.is_deprecated_hhmm is False
+
+    def test_at_daily_preset(self):
+        tz = ZoneInfo("UTC")
+        r = parse_schedule_key("@daily", tz)
+        assert r.trigger is not None
+        assert r.display_label == "@daily"
+        assert r.is_deprecated_hhmm is False
+
+    def test_legacy_hhmm(self):
+        tz = ZoneInfo("UTC")
+        r = parse_schedule_key("0900", tz)
+        assert r.trigger is not None
+        assert r.display_label == "09:00"
+        assert r.is_deprecated_hhmm is True
+
+    def test_invalid_expression(self):
+        tz = ZoneInfo("UTC")
+        r = parse_schedule_key("not-a-valid-cron", tz)
+        assert r.trigger is None
 
 
 class TestIsValidTimeFormat:
@@ -106,10 +139,87 @@ class TestSetupScheduledMessages:
         scheduler.bot.config.set("Scheduled_Messages", "0900", "general: Good morning!")
         self._setup_and_call(scheduler)
         assert "0900" in scheduler.scheduled_messages
-        channel, message = scheduler.scheduled_messages["0900"]
+        channel, message, label, scope = scheduler.scheduled_messages["0900"]
+        assert scope is None
         assert channel == "general"
         assert "Good morning!" in message
+        assert label == "09:00"
         assert len(scheduler._apscheduler.get_jobs()) == 1
+        self._teardown(scheduler)
+
+    def test_deprecated_hhmm_logs_migration_warning(self, scheduler):
+        scheduler.bot.config.add_section("Scheduled_Messages")
+        scheduler.bot.config.set("Scheduled_Messages", "0900", "general: Hi")
+        self._setup_and_call(scheduler)
+        warns = [str(c) for c in scheduler.bot.logger.warning.call_args_list]
+        assert any("deprecated" in w.lower() for w in warns)
+        assert any("HHMM" in w for w in warns)
+        self._teardown(scheduler)
+
+    def test_five_field_cron_registered(self, scheduler):
+        scheduler.bot.config.add_section("Scheduled_Messages")
+        scheduler.bot.config.set(
+            "Scheduled_Messages", "0 9 * * *", "general: Morning cron"
+        )
+        self._setup_and_call(scheduler)
+        assert "0 9 * * *" in scheduler.scheduled_messages
+        ch, msg, label, _scope = scheduler.scheduled_messages["0 9 * * *"]
+        assert _scope is None
+        assert ch == "general"
+        assert "Morning cron" in msg
+        assert label == "0 9 * * *"
+        assert len(scheduler._apscheduler.get_jobs()) == 1
+        msg_jobs = [
+            j for j in scheduler._apscheduler.get_jobs() if j.id.startswith("schedmsg_")
+        ]
+        assert msg_jobs[0].kwargs == {"schedule_key": "0 9 * * *", "scope": None}
+        self._teardown(scheduler)
+
+    def test_scoped_flood_message_stores_scope_and_job_kwargs(self, scheduler):
+        scheduler.bot.config.add_section("Scheduled_Messages")
+        scheduler.bot.config.set(
+            "Scheduled_Messages",
+            "0 18 * * *",
+            "Public:#sea:Hello! Come send test messages.",
+        )
+        self._setup_and_call(scheduler)
+        assert "0 18 * * *" in scheduler.scheduled_messages
+        ch, msg, label, scope = scheduler.scheduled_messages["0 18 * * *"]
+        assert ch == "Public"
+        assert scope == "#sea"
+        assert msg.startswith("Hello!")
+        msg_jobs = [
+            j for j in scheduler._apscheduler.get_jobs() if j.id.startswith("schedmsg_")
+        ]
+        assert len(msg_jobs) == 1
+        assert msg_jobs[0].kwargs == {"schedule_key": "0 18 * * *", "scope": "#sea"}
+        self._teardown(scheduler)
+
+    def test_at_weekly_preset_registered(self, scheduler):
+        scheduler.bot.config.add_section("Scheduled_Messages")
+        scheduler.bot.config.set(
+            "Scheduled_Messages", "@weekly", "alerts: Weekly digest"
+        )
+        self._setup_and_call(scheduler)
+        assert "@weekly" in scheduler.scheduled_messages
+        assert scheduler.scheduled_messages["@weekly"][2] == "@weekly"
+        assert len(scheduler._apscheduler.get_jobs()) == 1
+        self._teardown(scheduler)
+
+    def test_invalid_cron_skipped(self, scheduler):
+        scheduler.bot.config.add_section("Scheduled_Messages")
+        scheduler.bot.config.set(
+            "Scheduled_Messages", "not-a-cron", "general: should not run"
+        )
+        self._setup_and_call(scheduler)
+        assert "not-a-cron" not in scheduler.scheduled_messages
+        # Only non-message jobs (e.g. device-mode) could exist; no scheduled message job
+        msg_jobs = [
+            j
+            for j in scheduler._apscheduler.get_jobs()
+            if j.id.startswith("schedmsg_")
+        ]
+        assert len(msg_jobs) == 0
         self._teardown(scheduler)
 
     def test_invalid_time_format_is_skipped(self, scheduler):
@@ -147,8 +257,10 @@ class TestSetupScheduledMessages:
         scheduler.bot.config.add_section("Scheduled_Messages")
         scheduler.bot.config.set("Scheduled_Messages", "1000", r"general: Line1\nLine2")
         self._setup_and_call(scheduler)
-        _, message = scheduler.scheduled_messages["1000"]
+        _, message, label, _sc = scheduler.scheduled_messages["1000"]
+        assert _sc is None
         assert "\n" in message
+        assert label == "10:00"
         self._teardown(scheduler)
 
     def test_reload_replaces_existing_jobs(self, scheduler):
@@ -372,8 +484,9 @@ class TestMaybeRunDbBackup:
         fake_now.strftime = now.strftime
         fake_now.isocalendar.return_value = (2026, 11, 2)
         with patch.object(scheduler, "get_current_time", return_value=fake_now):
-            with patch.object(scheduler.maintenance, "run_db_backup") as mock_run:
-                scheduler._maybe_run_db_backup()
+            with patch.object(scheduler.maintenance, "_get_current_time", return_value=fake_now):
+                with patch.object(scheduler.maintenance, "run_db_backup") as mock_run:
+                    scheduler._maybe_run_db_backup()
         mock_run.assert_not_called()
 
 
@@ -464,18 +577,31 @@ class TestAPSchedulerLifecycle:
         assert scheduler._apscheduler is None
         scheduler.join(timeout=0.1)  # must not raise
 
-    def test_cron_trigger_hour_minute(self, scheduler):
-        """Registered jobs get a CronTrigger with the correct hour/minute."""
+    def test_cron_trigger_hour_minute_legacy_hhmm(self, scheduler):
+        """Legacy HHMM keys produce a CronTrigger with the correct hour/minute."""
         scheduler.bot.config.add_section("Scheduled_Messages")
         scheduler.bot.config.set("Scheduled_Messages", "1430", "ch: hello")
         scheduler.setup_scheduled_messages()
-        jobs = scheduler._apscheduler.get_jobs()
-        assert len(jobs) == 1
-        trigger = jobs[0].trigger
+        msg_jobs = [j for j in scheduler._apscheduler.get_jobs() if j.id.startswith("schedmsg_")]
+        assert len(msg_jobs) == 1
+        trigger = msg_jobs[0].trigger
         # CronTrigger fields: hour=14, minute=30
         field_map = {f.name: f for f in trigger.fields}
         assert str(field_map["hour"]) == "14"
         assert str(field_map["minute"]) == "30"
+        scheduler.join(timeout=1)
+
+    def test_cron_trigger_from_five_field_expression(self, scheduler):
+        """5-field crontab keys produce the expected hour/minute fields."""
+        scheduler.bot.config.add_section("Scheduled_Messages")
+        scheduler.bot.config.set("Scheduled_Messages", "15 10 * * *", "ch: ping")
+        scheduler.setup_scheduled_messages()
+        msg_jobs = [j for j in scheduler._apscheduler.get_jobs() if j.id.startswith("schedmsg_")]
+        assert len(msg_jobs) == 1
+        trigger = msg_jobs[0].trigger
+        field_map = {f.name: f for f in trigger.fields}
+        assert str(field_map["hour"]) == "10"
+        assert str(field_map["minute"]) == "15"
         scheduler.join(timeout=1)
 
 
@@ -575,7 +701,7 @@ class TestDbBackupIntervalGuard:
 # ---------------------------------------------------------------------------
 
 
-class TestFormatEmailBody:
+class TestFormatEmailBodyPure:
     """Tests for _format_email_body — pure string builder."""
 
     def setup_method(self):
@@ -695,9 +821,9 @@ class TestSendNightlyEmailDisabled:
         def _get_notif(key):
             return {"nightly_enabled": "false"}.get(key, "")
 
-        scheduler._get_notif = Mock(side_effect=_get_notif)
+        scheduler.maintenance.get_notif = Mock(side_effect=_get_notif)
         # Should not raise and should not call smtplib
-        scheduler._send_nightly_email()
+        scheduler.maintenance.send_nightly_email()
         # No assertion needed — if it reaches here without smtplib, it returned early
 
 
@@ -717,8 +843,11 @@ def _make_scheduler():
     config = _configparser.ConfigParser()
     config.add_section("Bot")
     config.set("Bot", "advert_interval_hours", "0")
+    config.set("Bot", "scheduled_message_max_stagger_seconds", "0")
     bot.config = config
     bot.main_event_loop = None
+    bot.is_radio_zombie = False
+    bot.is_radio_offline = False
 
     # db_manager.connection() context manager
     conn_mock = MagicMock()
@@ -880,7 +1009,7 @@ class TestSendScheduledMessageAsync:
         scheduler.bot.command_manager.send_channel_message = AsyncMock()
         asyncio.run(scheduler._send_scheduled_message_async("general", "Hello world"))
         scheduler.bot.command_manager.send_channel_message.assert_called_once_with(
-            "general", "Hello world"
+            "general", "Hello world", skip_user_rate_limit=True, scope=None
         )
 
     def test_with_placeholder_calls_get_mesh_info_and_formats(self):
@@ -917,7 +1046,7 @@ class TestSendScheduledMessageAsync:
                 )
         mock_fmt.assert_called_once()
         scheduler.bot.command_manager.send_channel_message.assert_called_once_with(
-            "general", "Contacts: 42"
+            "general", "Contacts: 42", skip_user_rate_limit=True, scope=None
         )
 
     def test_get_mesh_info_exception_sends_message_as_is(self):
@@ -935,7 +1064,7 @@ class TestSendScheduledMessageAsync:
                 )
             )
         scheduler.bot.command_manager.send_channel_message.assert_called_once_with(
-            "general", "Active: {total_contacts}"
+            "general", "Active: {total_contacts}", skip_user_rate_limit=True, scope=None
         )
 
     def test_format_placeholder_exception_sends_message_as_is(self):
@@ -957,8 +1086,41 @@ class TestSendScheduledMessageAsync:
                     )
                 )
         scheduler.bot.command_manager.send_channel_message.assert_called_once_with(
-            "alerts", "Count: {total_contacts}"
+            "alerts", "Count: {total_contacts}", skip_user_rate_limit=True, scope=None
         )
+
+    def test_passes_scope_to_send_channel_message(self):
+        scheduler = _make_scheduler()
+        scheduler.bot.command_manager.send_channel_message = AsyncMock()
+        asyncio.run(
+            scheduler._send_scheduled_message_async(
+                "Public", "Hi", scope="#sea"
+            )
+        )
+        scheduler.bot.command_manager.send_channel_message.assert_called_once_with(
+            "Public", "Hi", skip_user_rate_limit=True, scope="#sea"
+        )
+
+    def test_stagger_invokes_sleep_when_configured(self):
+        """Nonzero scheduled_message_max_stagger_seconds yields await sleep in [0, max)."""
+        scheduler = _make_scheduler()
+        scheduler.bot.config.set("Bot", "scheduled_message_max_stagger_seconds", "100")
+        scheduler.bot.command_manager.send_channel_message = AsyncMock()
+        with patch("modules.scheduler.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            asyncio.run(
+                scheduler._send_scheduled_message_async("g", "m", schedule_key="0 8 * * *")
+            )
+        mock_sleep.assert_called_once()
+        delay = mock_sleep.call_args[0][0]
+        assert 0 <= delay < 100
+
+    def test_stagger_seconds_deterministic_for_same_key(self):
+        scheduler = _make_scheduler()
+        scheduler.bot.config.set("Bot", "scheduled_message_max_stagger_seconds", "10")
+        a = scheduler._scheduled_message_stagger_seconds("0 8 * * 2")
+        b = scheduler._scheduled_message_stagger_seconds("0 8 * * 2")
+        assert a == b
+        assert 0 <= a < 10
 
 
 # ---------------------------------------------------------------------------
@@ -1012,7 +1174,13 @@ class TestSendScheduledMessageWrapper:
 
         mock_loop = Mock()
 
-        async def _fake_send(channel: str, message: str) -> None:
+        async def _fake_send(
+            channel: str,
+            message: str,
+            *,
+            schedule_key: str = "",
+            scope: str | None = None,
+        ) -> None:
             return None
 
         def _run_until_complete(coro):
@@ -1028,7 +1196,103 @@ class TestSendScheduledMessageWrapper:
 
         mock_loop.run_until_complete.assert_called_once()
         mock_loop.close.assert_called_once()
-        mock_send.assert_called_once_with("general", "test message")
+        mock_send.assert_called_once_with(
+            "general", "test message", schedule_key="", scope=None
+        )
+
+    def test_suppressed_when_radio_zombie(self):
+        scheduler = _make_scheduler()
+        scheduler.bot.is_radio_zombie = True
+        with patch("asyncio.run_coroutine_threadsafe") as mock_rct:
+            scheduler.send_scheduled_message("general", "hi")
+        mock_rct.assert_not_called()
+
+    def test_suppressed_when_radio_offline(self):
+        scheduler = _make_scheduler()
+        scheduler.bot.is_radio_offline = True
+        with patch("asyncio.run_coroutine_threadsafe") as mock_rct:
+            scheduler.send_scheduled_message("general", "hi")
+        mock_rct.assert_not_called()
+
+    def test_records_success_on_successful_send(self):
+        scheduler = _make_scheduler()
+        mock_loop = Mock()
+        mock_loop.is_running.return_value = True
+        scheduler.bot.main_event_loop = mock_loop
+        fake_future = Mock()
+        fake_future.result.return_value = None
+        def _run_coro_threadsafe(coro, loop):
+            coro.close()
+            return fake_future
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=_run_coro_threadsafe):
+            scheduler.send_scheduled_message("general", "hi")
+        scheduler.bot._record_send_success.assert_called_once()
+
+    def test_records_failure_on_exception(self):
+        scheduler = _make_scheduler()
+        mock_loop = Mock()
+        mock_loop.is_running.return_value = True
+        scheduler.bot.main_event_loop = mock_loop
+        fake_future = Mock()
+        fake_future.result.side_effect = Exception("bang")
+        def _run_coro_threadsafe(coro, loop):
+            coro.close()
+            return fake_future
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=_run_coro_threadsafe):
+            scheduler.send_scheduled_message("general", "hi")
+        scheduler.bot._record_send_failure.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# TestSendIntervalAdvertOfflineGuard
+# ---------------------------------------------------------------------------
+
+
+class TestSendIntervalAdvertOfflineGuard:
+    """Tests for send_interval_advert() radio state suppression guards."""
+
+    def test_suppressed_when_radio_zombie(self):
+        scheduler = _make_scheduler()
+        scheduler.bot.is_radio_zombie = True
+        with patch("asyncio.run_coroutine_threadsafe") as mock_rct:
+            scheduler.send_interval_advert()
+        mock_rct.assert_not_called()
+
+    def test_suppressed_when_radio_offline(self):
+        scheduler = _make_scheduler()
+        scheduler.bot.is_radio_offline = True
+        with patch("asyncio.run_coroutine_threadsafe") as mock_rct:
+            scheduler.send_interval_advert()
+        mock_rct.assert_not_called()
+
+    def test_records_success_on_successful_send(self):
+        scheduler = _make_scheduler()
+        mock_loop = Mock()
+        mock_loop.is_running.return_value = True
+        scheduler.bot.main_event_loop = mock_loop
+        fake_future = Mock()
+        fake_future.result.return_value = None
+        def _run_coro_threadsafe(coro, loop):
+            coro.close()
+            return fake_future
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=_run_coro_threadsafe):
+            scheduler.send_interval_advert()
+        scheduler.bot._record_send_success.assert_called_once()
+
+    def test_records_failure_on_exception(self):
+        from concurrent.futures import TimeoutError as FuturesTimeoutError
+        scheduler = _make_scheduler()
+        mock_loop = Mock()
+        mock_loop.is_running.return_value = True
+        scheduler.bot.main_event_loop = mock_loop
+        fake_future = Mock()
+        fake_future.result.side_effect = FuturesTimeoutError()
+        def _run_coro_threadsafe(coro, loop):
+            coro.close()
+            return fake_future
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=_run_coro_threadsafe):
+            scheduler.send_interval_advert()
+        scheduler.bot._record_send_failure.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1229,3 +1493,367 @@ class TestCollectEmailStats:
         assert result.get("contacts_total") == 50
         assert result.get("contacts_24h") == 10
         assert result.get("contacts_new_24h") == 3
+
+
+# ---------------------------------------------------------------------------
+# _send_interval_advert_async (PR2 fix — Event-based error detection)
+# ---------------------------------------------------------------------------
+
+
+def _make_sched_with_logger(mock_logger):
+    """Return a MessageScheduler backed by a mock bot with the given logger."""
+    bot = Mock()
+    bot.logger = mock_logger
+    bot.config = ConfigParser()
+    bot.config.add_section("Bot")
+    bot.config.set("Bot", "scheduled_message_max_stagger_seconds", "0")
+    bot.is_radio_zombie = False   # ensure zombie guard does not suppress sends
+    bot.is_radio_offline = False  # ensure offline guard does not suppress sends
+    return MessageScheduler(bot)
+
+
+class TestSendIntervalAdvertAsyncFixed:
+    """Tests for MessageScheduler._send_interval_advert_async() (PR2 fix)."""
+
+    def test_error_event_raises_runtime_error(self, mock_logger):
+        from meshcore.events import EventType
+
+        sched = _make_sched_with_logger(mock_logger)
+        error_event = MagicMock()
+        error_event.type = EventType.ERROR
+        error_event.payload = {"reason": "no_event_received"}
+        sched.bot.meshcore.commands.send_advert = AsyncMock(return_value=error_event)
+
+        with pytest.raises(RuntimeError, match="send_advert failed"):
+            asyncio.run(sched._send_interval_advert_async())
+
+    def test_error_event_includes_reason_in_message(self, mock_logger):
+        from meshcore.events import EventType
+
+        sched = _make_sched_with_logger(mock_logger)
+        error_event = MagicMock()
+        error_event.type = EventType.ERROR
+        error_event.payload = {"reason": "no_event_received"}
+        sched.bot.meshcore.commands.send_advert = AsyncMock(return_value=error_event)
+
+        with pytest.raises(RuntimeError, match="no_event_received"):
+            asyncio.run(sched._send_interval_advert_async())
+
+    def test_ok_event_logs_success(self, mock_logger):
+        from meshcore.events import EventType
+
+        sched = _make_sched_with_logger(mock_logger)
+        ok_event = MagicMock()
+        ok_event.type = EventType.OK
+        sched.bot.meshcore.commands.send_advert = AsyncMock(return_value=ok_event)
+
+        asyncio.run(sched._send_interval_advert_async())
+
+        sched.bot.logger.info.assert_called_with(
+            "Interval-based flood advert sent successfully"
+        )
+
+    def test_timeout_increments_radio_fail_count_and_reraises(self, mock_logger):
+        sched = _make_sched_with_logger(mock_logger)
+        sched.bot._radio_fail_count = 2
+
+        async def run():
+            async def fake_wait_for(coro, timeout):
+                coro.close()
+                raise asyncio.TimeoutError()
+
+            with patch("asyncio.wait_for", side_effect=fake_wait_for):
+                await sched._send_interval_advert_async()
+
+        with pytest.raises(asyncio.TimeoutError):
+            asyncio.run(run())
+
+        assert sched.bot._radio_fail_count == 3
+        sched.bot.logger.warning.assert_called_with(
+            "send_interval_advert timed out after 30s; _radio_fail_count=%d",
+            3,
+        )
+
+    def test_send_interval_advert_logs_exception_type_name(self, mock_logger):
+        """Error log must include type(e).__name__ so blank TimeoutError is visible."""
+        from concurrent.futures import TimeoutError as FuturesTimeoutError
+
+        sched = _make_sched_with_logger(mock_logger)
+
+        future_mock = MagicMock()
+        future_mock.result = MagicMock(side_effect=FuturesTimeoutError())
+
+        loop_mock = MagicMock()
+        loop_mock.is_running.return_value = True
+        sched.bot.main_event_loop = loop_mock
+
+        def _run_coro_threadsafe(coro, loop):
+            coro.close()
+            return future_mock
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=_run_coro_threadsafe):
+            sched.send_interval_advert()
+
+        # The error log must include the class name, not just str(e) which
+        # would be empty for concurrent.futures.TimeoutError
+        call_args_list = mock_logger.error.call_args_list
+        assert call_args_list, "logger.error was never called"
+        logged = str(call_args_list[0])
+        assert "TimeoutError" in logged
+
+
+# ---------------------------------------------------------------------------
+# _send_scheduled_message_async (PR2 fix — asyncio.wait_for wrapping)
+# ---------------------------------------------------------------------------
+
+
+class TestSendScheduledMessageAsyncTimeout:
+    """Tests for _send_scheduled_message_async() asyncio.wait_for wrapping (PR2)."""
+
+    def test_success_calls_send_channel_message(self, mock_logger):
+        sched = _make_sched_with_logger(mock_logger)
+        sched.bot.command_manager.send_channel_message = AsyncMock(return_value=None)
+
+        asyncio.run(sched._send_scheduled_message_async("#general", "hello"))
+
+        sched.bot.command_manager.send_channel_message.assert_awaited_once_with(
+            "#general", "hello", skip_user_rate_limit=True, scope=None
+        )
+
+    def test_timeout_raises_asyncio_timeout_error(self, mock_logger):
+        sched = _make_sched_with_logger(mock_logger)
+
+        async def run():
+            async def fake_wait_for(coro, timeout):
+                raise asyncio.TimeoutError()
+
+            with patch("asyncio.wait_for", side_effect=fake_wait_for):
+                await sched._send_scheduled_message_async("#general", "hello")
+
+        with pytest.raises(asyncio.TimeoutError):
+            asyncio.run(run())
+
+    def test_send_timeout_seconds_config_used(self, mock_logger):
+        """send_timeout_seconds from config is passed to wait_for."""
+        sched = _make_sched_with_logger(mock_logger)
+        sched.bot.config.set("Bot", "send_timeout_seconds", "45")
+        sched.bot.command_manager.send_channel_message = AsyncMock(return_value=None)
+
+        captured_timeout = []
+
+        async def spy_wait_for(coro, timeout):
+            captured_timeout.append(timeout)
+            return await coro
+
+        async def run():
+            with patch("asyncio.wait_for", side_effect=spy_wait_for):
+                await sched._send_scheduled_message_async("#general", "hello")
+
+        asyncio.run(run())
+        assert captured_timeout == [45]
+
+    def test_send_scheduled_message_logs_exception_type_name(self, mock_logger):
+        """Error log must include type(e).__name__."""
+        from concurrent.futures import TimeoutError as FuturesTimeoutError
+
+        sched = _make_sched_with_logger(mock_logger)
+
+        future_mock = MagicMock()
+        future_mock.result = MagicMock(side_effect=FuturesTimeoutError())
+
+        loop_mock = MagicMock()
+        loop_mock.is_running.return_value = True
+        sched.bot.main_event_loop = loop_mock
+
+        def _run_coro_threadsafe(coro, loop):
+            coro.close()
+            return future_mock
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=_run_coro_threadsafe):
+            sched.send_scheduled_message("#general", "hello")
+
+        call_args_list = mock_logger.error.call_args_list
+        assert call_args_list, "logger.error was never called"
+        logged = str(call_args_list[0])
+        assert "TimeoutError" in logged
+# ---------------------------------------------------------------------------
+# SSRF guard — SMTP host validation in email-sending methods
+# ---------------------------------------------------------------------------
+
+
+def _make_smtp_scheduler(
+    notif_overrides: dict,
+    meta_overrides: dict | None = None,
+) -> "MessageScheduler":
+    """Return a scheduler whose maintenance.get_notif returns values from notif_overrides."""
+    bot = Mock()
+    bot.logger = Mock()
+    bot.config = ConfigParser()
+    bot.config.add_section("Bot")
+    bot.config.set("Bot", "radio_zombie_alert_enabled", "true")
+    bot.config.set("Bot", "radio_zombie_alert_email", "")
+    bot.config.add_section("Connection")
+    bot.config.set("Connection", "connection_type", "serial")
+    metadata = dict(meta_overrides or {})
+    bot.db_manager = Mock()
+    bot.db_manager.get_metadata = Mock(side_effect=lambda key: metadata.get(key, ""))
+    sched = MessageScheduler(bot)
+    defaults = {
+        "nightly_enabled": "true",
+        "smtp_host": "smtp.example.com",
+        "smtp_port": "587",
+        "smtp_security": "starttls",
+        "smtp_user": "",
+        "smtp_password": "",
+        "from_name": "Bot",
+        "from_email": "bot@example.com",
+        "recipients": "admin@example.com",
+    }
+    defaults.update(notif_overrides)
+    sched.maintenance.get_notif = Mock(side_effect=lambda k: defaults.get(k, ""))
+    sched._get_notif = Mock(side_effect=lambda k: defaults.get(k, ""))  # zombie alert still uses _get_notif
+    return sched
+
+
+class TestNightlyEmailSsrfGuard:
+    """send_nightly_email must abort on private IP unless allow_local_smtp=true."""
+
+    @pytest.mark.parametrize("bad_host", [
+        "10.0.0.1",       # RFC 1918 10.0.0.0/8
+        "172.16.0.1",     # RFC 1918 172.16.0.0/12
+        "192.168.1.1",    # RFC 1918 192.168.0.0/16
+        "127.0.0.1",      # RFC 1122 127.0.0.0/8 loopback
+        "169.254.0.1",    # RFC 3927 169.254.0.0/16 link-local
+        "100.64.0.1",     # RFC 6598 100.64.0.0/10 shared/CGN
+        "::1",            # RFC 4291 ::1/128 IPv6 loopback
+        "fd00::1",        # RFC 4193 fc00::/7 IPv6 ULA
+        "fe80::1",        # RFC 4291 fe80::/10 IPv6 link-local
+    ])
+    def test_private_smtp_host_aborts_nightly_email(self, bad_host):
+        sched = _make_smtp_scheduler({"smtp_host": bad_host})
+        sched.maintenance.send_nightly_email()
+        sched.bot.logger.error.assert_called()
+        logged = str(sched.bot.logger.error.call_args_list)
+        assert "private" in logged.lower() or "reserved" in logged.lower()
+
+    @pytest.mark.parametrize("local_host", ["127.0.0.1", "192.168.1.1"])
+    def test_allow_local_smtp_bypasses_ssrf_guard(self, local_host):
+        """allow_local_smtp=true permits private-IP SMTP (e.g. local Postfix)."""
+        sched = _make_smtp_scheduler({"smtp_host": local_host, "allow_local_smtp": "true"})
+        # Should not abort at the SSRF guard — will fail at smtplib (connection refused)
+        # so error log must NOT contain the SSRF rejection message
+        with patch("smtplib.SMTP", side_effect=ConnectionRefusedError("no server")):
+            with patch("smtplib.SMTP_SSL", side_effect=ConnectionRefusedError("no server")):
+                sched.maintenance.send_nightly_email()
+        logged = str(sched.bot.logger.error.call_args_list)
+        assert "private" not in logged.lower() and "reserved" not in logged.lower()
+
+
+class TestZombieAlertEmailSsrfGuard:
+    """send_zombie_alert_email must abort on private IP unless allow_local_smtp=true."""
+
+    @pytest.mark.parametrize("bad_host", [
+        "10.0.0.1",       # RFC 1918 10.0.0.0/8
+        "172.16.0.1",     # RFC 1918 172.16.0.0/12
+        "192.168.1.1",    # RFC 1918 192.168.0.0/16
+        "127.0.0.1",      # RFC 1122 127.0.0.0/8 loopback
+        "169.254.0.1",    # RFC 3927 169.254.0.0/16 link-local
+        "100.64.0.1",     # RFC 6598 100.64.0.0/10 shared/CGN
+        "::1",            # RFC 4291 ::1/128 IPv6 loopback
+        "fd00::1",        # RFC 4193 fc00::/7 IPv6 ULA
+        "fe80::1",        # RFC 4291 fe80::/10 IPv6 link-local
+    ])
+    def test_private_smtp_host_aborts_zombie_alert(self, bad_host):
+        sched = _make_smtp_scheduler({"smtp_host": bad_host})
+        sched.send_zombie_alert_email(fail_count=5, threshold=3, interval=60)
+        sched.bot.logger.error.assert_called()
+        logged = str(sched.bot.logger.error.call_args_list)
+        assert "private" in logged.lower() or "reserved" in logged.lower()
+
+    def test_allow_local_smtp_bypasses_ssrf_guard_zombie_alert(self):
+        """allow_local_smtp=true permits private-IP SMTP for zombie alert."""
+        sched = _make_smtp_scheduler({"smtp_host": "127.0.0.1", "allow_local_smtp": "true"})
+        with patch("smtplib.SMTP", side_effect=ConnectionRefusedError("no server")):
+            with patch("smtplib.SMTP_SSL", side_effect=ConnectionRefusedError("no server")):
+                sched.send_zombie_alert_email(fail_count=5, threshold=3, interval=60)
+        logged = str(sched.bot.logger.error.call_args_list)
+        assert "private" not in logged.lower() and "reserved" not in logged.lower()
+
+    def test_metadata_alert_enabled_false_suppresses_zombie_alert(self):
+        """zombie.alert_enabled metadata should suppress alert sending immediately."""
+        sched = _make_smtp_scheduler(
+            {"smtp_host": "smtp.example.com", "from_email": "bot@example.com"},
+            {"zombie.alert_enabled": "false"},
+        )
+        with patch("smtplib.SMTP") as mock_smtp:
+            with patch("smtplib.SMTP_SSL") as mock_smtp_ssl:
+                sched.send_zombie_alert_email(fail_count=5, threshold=3, interval=60)
+        mock_smtp.assert_not_called()
+        mock_smtp_ssl.assert_not_called()
+
+
+class TestDeviceModeSchedulerJobs:
+    """_setup_device_mode_scheduler_jobs registers one-shot jobs when auto_manage_contacts=device."""
+
+    def test_registers_three_jobs_in_device_mode(self, scheduler):
+        scheduler.bot.config.set("Bot", "auto_manage_contacts", "device")
+        mock_ap = MagicMock()
+        scheduler._apscheduler = mock_ap
+        scheduler._setup_device_mode_scheduler_jobs()
+        assert mock_ap.add_job.call_count == 3
+        ids = {call.kwargs["id"] for call in mock_ap.add_job.call_args_list}
+        assert ids == {
+            "device_mode_firmware_autoadd",
+            "device_mode_favourite_pass1",
+            "device_mode_favourite_pass2",
+        }
+        for call in mock_ap.add_job.call_args_list:
+            assert call.kwargs.get("replace_existing") is True
+
+    def test_no_jobs_when_not_device_mode(self, scheduler):
+        scheduler.bot.config.set("Bot", "auto_manage_contacts", "bot")
+        mock_ap = MagicMock()
+        scheduler._apscheduler = mock_ap
+        scheduler._setup_device_mode_scheduler_jobs()
+        mock_ap.add_job.assert_not_called()
+
+    def test_firmware_job_sync_skips_when_not_device(self, scheduler):
+        scheduler.bot.config.set("Bot", "auto_manage_contacts", "bot")
+        with patch.object(scheduler, "_run_async_on_main_loop") as mock_run:
+            scheduler._device_mode_firmware_job_sync()
+        mock_run.assert_not_called()
+
+    def test_run_async_warns_without_running_loop(self, scheduler, mock_logger):
+        scheduler.bot.logger = mock_logger
+        scheduler.bot.main_event_loop = None
+
+        async def trivial():
+            pass
+
+        coro = trivial()
+        try:
+            scheduler._run_async_on_main_loop(coro, timeout=1.0)
+        finally:
+            coro.close()
+        mock_logger.warning.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_device_mode_firmware_coro_calls_repeater_manager(self, scheduler):
+        scheduler.bot.config.set("Bot", "auto_manage_contacts", "device")
+        scheduler.bot.repeater_manager = Mock()
+        scheduler.bot.repeater_manager.apply_device_mode_firmware_preferences = AsyncMock(return_value=True)
+
+        await scheduler._device_mode_firmware_coro()
+
+        scheduler.bot.repeater_manager.apply_device_mode_firmware_preferences.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_device_mode_favourite_coros_delegate(self, scheduler):
+        scheduler.bot.config.set("Bot", "auto_manage_contacts", "device")
+        scheduler.bot.repeater_manager = Mock()
+        scheduler.bot.repeater_manager.sync_device_mode_favourites_pass1 = AsyncMock()
+        scheduler.bot.repeater_manager.sync_device_mode_favourites_pass2 = AsyncMock()
+
+        await scheduler._device_mode_favourite_pass1_coro()
+        await scheduler._device_mode_favourite_pass2_coro()
+
+        scheduler.bot.repeater_manager.sync_device_mode_favourites_pass1.assert_awaited_once()
+        scheduler.bot.repeater_manager.sync_device_mode_favourites_pass2.assert_awaited_once()

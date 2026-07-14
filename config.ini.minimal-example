@@ -4,6 +4,7 @@
 #                                                                                                  #
 #  This is a minimal configuration file that enables only the core testing commands:               #
 #  - ping: Simple connectivity test                                                                #
+#  - version (ver): Show running bot version                                                       #
 #  - test (t): Connection info with optional phrase                                                #
 #  - path (p): Decode hex path data to show repeaters                                              #
 #  - prefix: Look up repeaters by two-character prefix                                             #
@@ -47,6 +48,15 @@ serial_port = /dev/ttyUSB0
 # Connection timeout in seconds
 timeout = 30
 
+# Radio health / alert defaults
+radio_probe_interval_seconds = 300
+radio_probe_fail_threshold = 3
+radio_zombie_alert_enabled = false
+radio_zombie_alert_email =
+radio_offline_threshold = 3
+radio_offline_alert_enabled = false
+radio_offline_alert_email =
+
 [Bot]
 # Bot name for identification and logging
 bot_name = MeshCoreBot
@@ -63,6 +73,16 @@ enable_enhanced_correlation = true
 
 # Bot node ID (leave empty for auto-assignment)
 node_id = 
+
+# Respond to channel messages when the bot is mentioned via @[bot_name]
+# Controls how the bot handles @[bot_name] mentions in channel messages:
+#   also   - Default. Mention is stripped when present, but commands also work without a mention.
+#            Lets "@[BotName] ping" and "ping" both work.
+#   only   - Bot only responds to channel messages that include @[bot_name].
+#            Messages without a mention are silently ignored.
+#   false  - Mentions not handled; bot responds to all matching commands as before.
+# DMs are always processed normally regardless of this setting.
+respond_to_mentions = also
 
 # Enable/disable bot responses
 # true: Bot will respond to keywords and commands
@@ -84,7 +104,7 @@ bot_tx_rate_limit_seconds = 1.0
 
 # Per-user rate limit: minimum seconds between bot replies to the same user
 # User key: public key when available, else sender name
-per_user_rate_limit_seconds = 5
+per_user_rate_limit_seconds = 30
 per_user_rate_limit_enabled = true
 
 # Transmission delay in milliseconds before sending messages
@@ -145,6 +165,12 @@ db_path = meshcore_bot.db
 
 # Local plugins directory (optional). Default: local. See config.ini.example.
 #local_dir_path = local
+
+[Admin]
+# Local admin API (127.0.0.1 only)
+enabled = false
+port = 5001
+token =
 
 [Localization]
 # Language code for bot responses (en, es, es-MX, es-ES, fr, de, ja, etc.)
@@ -210,7 +236,7 @@ respond_to_dms = true
 # Maximum hops for a message to get a response
 # Default: 64 - for backwards compatibility
 # Suggested: 10
-max_response_hops = 10
+max_response_hops = 7
 
 # Optional: limit channel responses to certain keywords (e.g. help,ping,test).
 # When set, only these triggers work in channels; DMs get all triggers.
@@ -224,6 +250,8 @@ banned_users =
 [Feed_Manager]
 # Enable or disable RSS/API feed subscriptions (disabled by default)
 feed_manager_enabled = false
+# Allow private/internal feed URLs (default false for SSRF safety)
+allow_private_urls = false
 
 [Logging]
 # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
@@ -255,6 +283,7 @@ meshcore_log_level = INFO
 #                                                                                                  #
 #  This minimal configuration enables only the core testing commands:                              #
 #  - ping: Simple connectivity test                                                                #
+#  - version (ver): Show running bot version                                                       #
 #  - test (t): Connection info with optional phrase                                                #
 #  - path (p): Decode hex path data to show repeaters                                              #
 #  - prefix: Look up repeaters by two-character prefix                                             #
@@ -268,11 +297,19 @@ meshcore_log_level = INFO
 # false: Ping command is disabled
 enabled = true
 
+[Version_Command]
+# Enable or disable the version command
+# true: Version command is available (responds to 'version' or 'ver')
+# false: Version command is disabled
+enabled = true
+
 [Test_Command]
 # Enable or disable the test command
 # true: Test command is available (responds to 'test' or 't')
 # false: Test command is disabled
 enabled = true
+# Optional: overrides [Keywords] test; supports {field|pathbytes_min:2|prefix_if_nonempty: | Path Dist: } style filters (see config.ini.example [Test_Command])
+# response_format =
 
 [Path_Command]
 # Enable or disable the path command
@@ -284,6 +321,12 @@ enabled = true
 # true: Respond to just "p" or "p <path_data>" as a shortcut for "path"
 # false: Only respond to "path", "decode", or "route" keywords (default)
 enable_p_shortcut = true
+
+# Optional prefix on path replies: {sender}, {connection_info}, {path}, {timestamp}, {snr}, {rssi}
+# reply_prefix = @[{sender}]
+
+# Bytes per hop before DB repeater lookup (0/1 = off; 2 or 3 = gate weak paths to hex-only + tip)
+# minimum_path_bytes = 0
 
 # Geographic proximity calculation method
 # simple: Use proximity to bot location (default)
@@ -367,7 +410,7 @@ enabled = true
 # {listening_duration}: Listening window duration in seconds
 # Leave empty to use default format
 # Example: "Found {path_count} unique path(s) for @[{sender}]:\n{paths}"
-response_format = 
+response_format = Found {path_count} unique path(s) for @[{sender}]:\n{paths}
 
 ####################################################################################################
 #                                                                                                  #
@@ -493,3 +536,5 @@ enabled = false
 [Feed_Command]
 # Enable or disable the feed command
 enabled = false
+# Allow private/internal feed URLs (default false for SSRF safety)
+allow_private_urls = false

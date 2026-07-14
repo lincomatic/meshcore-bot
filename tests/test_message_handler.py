@@ -8,6 +8,7 @@ import pytest
 
 from modules.message_handler import MessageHandler
 from modules.models import MeshMessage
+from tests.conftest import mock_message as make_message
 
 
 @pytest.fixture
@@ -1212,6 +1213,32 @@ class TestParseAdvert:
         result = handler.parse_advert(payload)
         assert result["mode"] == "Type5"
 
+    def test_advert_flags_0xfd_invalid_for_python_flag_still_parses(self, handler):
+        """0xFD sets type nibble 0x0D; enum.Flag rejected this — parsing must match firmware bit tests."""
+        payload = _make_advert_payload(
+            0xFD,
+            location_lat_raw=1000000,
+            location_lon_raw=-2000000,
+            feat1=0x0001,
+            feat2=0x0002,
+            name="CorruptWire",
+        )
+        result = handler.parse_advert(payload)
+        assert result != {}
+        assert result["mode"] == "Type13"
+        assert result["lat"] == 1.0
+        assert result["lon"] == -2.0
+        assert result["feat1"] == 0x0001
+        assert result["feat2"] == 0x0002
+        assert result["name"] == "CorruptWire"
+
+    def test_advert_type_nibble_8_no_extra_flags(self, handler):
+        """Low nibble 8 sets bit 0x08 alone — must not raise."""
+        payload = _make_advert_payload(0x08)
+        result = handler.parse_advert(payload)
+        assert result["mode"] == "Type8"
+        assert "lat" not in result
+
     def test_companion_with_name(self, handler):
         # ADV_NAME_MASK=0x80 | ADV_TYPE_CHAT=0x01
         payload = _make_advert_payload(0x81, name="TestNode")
@@ -1520,6 +1547,83 @@ class TestHandleRfLogData:
             await handler.handle_rf_log_data(event)
         handler.logger.error.assert_called()
 
+    async def test_tc_flood_scope_fields_from_library_payload(self, handler):
+        """Library-provided route_type/transport_code/pkt_payload populate scope fields."""
+        import hmac as hmac_mod
+        from hashlib import sha256
+        self._setup_handler(handler)
+
+        scope_name = "#waw"
+        payload_type = 5       # GRP_TXT
+        pkt_payload_bytes = b"\xca\xb2\x83\xf7\x84\xe1\x17\x40\x2c\x81"
+
+        # Compute the expected transport code (same HMAC logic as _match_scope)
+        key = sha256(scope_name.encode()).digest()[:16]
+        check_data = bytes([payload_type]) + pkt_payload_bytes
+        digest = hmac_mod.new(key, check_data, sha256).digest()
+        code1 = int.from_bytes(digest[:2], "little")
+        if code1 == 0:
+            code1 = 1
+        elif code1 == 0xFFFF:
+            code1 = 0xFFFE
+
+        # Transport code hex as the library emits it (4 bytes: code1 LE + code2 LE)
+        tc_hex = code1.to_bytes(2, "little").hex() + "0000"
+
+        raw_hex = "ab" * 32  # 64 hex chars → packet_prefix is first 32
+        event = self._make_event({
+            "snr": 5.0,
+            "raw_hex": raw_hex,
+            # Library-provided fields from meshcore-py parsePacketPayload
+            "route_type": 0,                  # TC_FLOOD
+            "transport_code": tc_hex,
+            "payload_type": payload_type,
+            "pkt_payload": pkt_payload_bytes,
+        })
+        await handler.handle_rf_log_data(event)
+
+        assert len(handler.recent_rf_data) == 1
+        entry = handler.recent_rf_data[0]
+        assert entry["route_type_int"] == 0
+        assert entry["transport_code1"] == code1
+        assert entry["payload_type_int"] == payload_type
+        assert entry["scope_payload_hex"] == pkt_payload_bytes.hex()
+
+    async def test_tc_flood_scope_fields_pkt_payload_as_hex_string(self, handler):
+        """pkt_payload stored as hex string (not bytes) is also accepted."""
+        self._setup_handler(handler)
+        pkt_payload_bytes = b"\xde\xad\xbe\xef"
+        raw_hex = "cd" * 32
+        event = self._make_event({
+            "snr": 3.0,
+            "raw_hex": raw_hex,
+            "route_type": 0,
+            "transport_code": "1234" + "0000",
+            "payload_type": 5,
+            "pkt_payload": pkt_payload_bytes.hex(),  # hex string variant
+        })
+        await handler.handle_rf_log_data(event)
+
+        entry = handler.recent_rf_data[0]
+        assert entry["scope_payload_hex"] == pkt_payload_bytes.hex()
+
+    async def test_flood_route_type_not_zero(self, handler):
+        """Plain FLOOD (route_type=1) stores route_type_int=1 and no transport code."""
+        self._setup_handler(handler)
+        raw_hex = "ef" * 32
+        event = self._make_event({
+            "snr": 2.0,
+            "raw_hex": raw_hex,
+            "route_type": 1,    # FLOOD, not TC_FLOOD
+            "payload_type": 5,
+            "pkt_payload": b"\xaa\xbb",
+        })
+        await handler.handle_rf_log_data(event)
+
+        entry = handler.recent_rf_data[0]
+        assert entry["route_type_int"] == 1
+        assert entry["transport_code1"] is None
+
 
 # ---------------------------------------------------------------------------
 # _get_path_from_rf_data
@@ -1617,3 +1721,324 @@ class TestSignalCacheLRUBounds:
         assert len(handler.snr_cache) == 2
         assert handler.snr_cache["a"] == 5.0
         assert handler.snr_cache["b"] == 2.0
+
+
+# ---------------------------------------------------------------------------
+# respond_to_mentions — process_message gate and stripping
+# ---------------------------------------------------------------------------
+
+class TestRespondToMentions:
+    """Tests for the respond_to_mentions config gate in process_message.
+
+    process_message is async; we short-circuit the command execution
+    side-effects by mocking should_process_message to return True and
+    stubbing out check_keywords / execute_commands so only the mention
+    block is exercised.
+    """
+
+    @pytest.fixture
+    def mention_bot(self, mock_logger):
+        """Bot fixture with respond_to_mentions support."""
+        bot = Mock()
+        bot.logger = mock_logger
+        bot.config = configparser.ConfigParser()
+        bot.config.add_section("Bot")
+        bot.config.set("Bot", "enabled", "true")
+        bot.config.set("Bot", "bot_name", "TestBot")
+        bot.config.set("Bot", "rf_data_timeout", "15.0")
+        bot.config.set("Bot", "message_correlation_timeout", "10.0")
+        bot.config.set("Bot", "enable_enhanced_correlation", "true")
+        bot.config.add_section("Channels")
+        bot.config.set("Channels", "respond_to_dms", "true")
+        bot.config.set("Channels", "max_response_hops", "64")
+        bot.connection_time = None
+        bot.prefix_hex_chars = 2
+        bot.channel_responses_enabled = True
+        bot.command_manager = Mock()
+        bot.command_manager.monitor_channels = ["general"]
+        bot.command_manager.is_user_banned = Mock(return_value=False)
+        bot.command_manager.commands = {}
+        bot.command_manager.check_keywords = Mock(return_value=[])
+        bot.command_manager.match_randomline = Mock(return_value=None)
+        bot.command_manager.execute_commands = AsyncMock()
+        return bot
+
+    @pytest.fixture
+    def mention_handler(self, mention_bot):
+        return MessageHandler(mention_bot)
+
+    def _channel_msg(self, content, channel="general"):
+        return make_message(content=content, channel=channel, is_dm=False, sender_id="User")
+
+    def _dm_msg(self, content):
+        return make_message(content=content, channel=None, is_dm=True, sender_id="User")
+
+    # ------------------------------------------------------------------ also --
+    async def test_also_plain_command_processed(self, mention_handler, mention_bot):
+        """'also': plain channel message (no mention) is still processed."""
+        mention_bot.config.set("Bot", "respond_to_mentions", "also")
+        msg = self._channel_msg("ping")
+        await mention_handler.process_message(msg)
+        # Command execution was reached; content unchanged
+        assert msg.content == "ping"
+
+    async def test_also_strips_bot_mention_from_content(self, mention_handler, mention_bot):
+        """'also': @[TestBot] is stripped before command dispatch."""
+        mention_bot.config.set("Bot", "respond_to_mentions", "also")
+        msg = self._channel_msg("@[TestBot] ping")
+        await mention_handler.process_message(msg)
+        assert msg.content == "ping"
+
+    async def test_also_case_insensitive_strip(self, mention_handler, mention_bot):
+        """'also': bot name match is case-insensitive."""
+        mention_bot.config.set("Bot", "respond_to_mentions", "also")
+        msg = self._channel_msg("@[testbot] ping")
+        await mention_handler.process_message(msg)
+        assert msg.content == "ping"
+
+    async def test_also_dm_bypasses_mention_logic(self, mention_handler, mention_bot):
+        """'also': DMs are never subject to mention stripping or gating."""
+        mention_bot.config.set("Bot", "respond_to_mentions", "also")
+        msg = self._dm_msg("@[TestBot] ping")
+        await mention_handler.process_message(msg)
+        # Content should remain as-is — mention logic skipped for DMs
+        assert "@[TestBot]" in msg.content
+
+    # ------------------------------------------------------------------ only --
+    async def test_only_with_mention_processes(self, mention_handler, mention_bot):
+        """'only': message with bot mention is processed (mention stripped)."""
+        mention_bot.config.set("Bot", "respond_to_mentions", "only")
+        msg = self._channel_msg("@[TestBot] ping")
+        await mention_handler.process_message(msg)
+        assert msg.content == "ping"
+        mention_bot.command_manager.execute_commands.assert_called_once()
+
+    async def test_only_without_mention_ignored(self, mention_handler, mention_bot):
+        """'only': plain channel message is silently dropped."""
+        mention_bot.config.set("Bot", "respond_to_mentions", "only")
+        msg = self._channel_msg("ping")
+        await mention_handler.process_message(msg)
+        mention_bot.command_manager.execute_commands.assert_not_called()
+
+    async def test_only_dm_always_processed(self, mention_handler, mention_bot):
+        """'only': DMs bypass the mention gate and are always processed."""
+        mention_bot.config.set("Bot", "respond_to_mentions", "only")
+        msg = self._dm_msg("ping")
+        await mention_handler.process_message(msg)
+        mention_bot.command_manager.execute_commands.assert_called_once()
+
+    # ------------------------------------------------------------------ false --
+    async def test_false_no_stripping(self, mention_handler, mention_bot):
+        """'false': mention is NOT stripped from message content."""
+        mention_bot.config.set("Bot", "respond_to_mentions", "false")
+        msg = self._channel_msg("@[TestBot] ping")
+        await mention_handler.process_message(msg)
+        # Content must still contain the mention — no stripping in false mode
+        assert "@[TestBot]" in msg.content
+
+    async def test_false_plain_command_processed(self, mention_handler, mention_bot):
+        """'false': plain commands work exactly as before."""
+        mention_bot.config.set("Bot", "respond_to_mentions", "false")
+        msg = self._channel_msg("ping")
+        await mention_handler.process_message(msg)
+        assert msg.content == "ping"
+        mention_bot.command_manager.execute_commands.assert_called_once()
+
+
+class TestProcessMessageDmKeywordRouting:
+    """Regression tests for DM keyword reply routing."""
+
+    @pytest.mark.asyncio
+    async def test_keyword_reply_uses_pubkey_for_dm_send(self, handler):
+        """DM keyword flow should route reply via send_response using pubkey identity."""
+        handler.should_process_message = Mock(return_value=True)
+        handler.bot.command_manager.check_keywords = Mock(return_value=[("test", "ack")])
+        handler.bot.command_manager.match_randomline = Mock(return_value=None)
+        handler.bot.command_manager.execute_commands = AsyncMock()
+        handler.bot.command_manager.get_rate_limit_key = Mock(return_value="ab12deadbeef")
+        handler.bot.command_manager.send_response = AsyncMock(return_value=True)
+        handler.bot.command_manager.commands = {}
+
+        message = MeshMessage(
+            content="test",
+            sender_id="ab12",
+            sender_pubkey="ab12deadbeefcafebabe",
+            is_dm=True,
+        )
+
+        await handler.process_message(message)
+
+        handler.bot.command_manager.send_response.assert_awaited_once()
+        call = handler.bot.command_manager.send_response.await_args
+        assert call.args[0] is message
+        assert call.args[1] == "ack"
+        assert call.kwargs["command_id"].startswith("keyword_test_ab12_")
+
+
+class TestProcessMessageChannelKeywordFloodScope:
+    """Keyword channel replies must use send_response so flood scope is applied (#178)."""
+
+    @pytest.mark.asyncio
+    async def test_keyword_channel_reply_passes_message_with_reply_scope(self, handler, bot):
+        handler.should_process_message = Mock(return_value=True)
+        bot.command_manager.check_keywords = Mock(return_value=[("wx", "sunny")])
+        bot.command_manager.match_randomline = Mock(return_value=None)
+        bot.command_manager.execute_commands = AsyncMock()
+        bot.command_manager.send_response = AsyncMock(return_value=True)
+        bot.command_manager.commands = {}
+
+        message = MeshMessage(
+            content="wx",
+            channel="#bot",
+            is_dm=False,
+            sender_id="alice",
+            reply_scope="#pl-mz",
+        )
+
+        await handler.process_message(message)
+
+        bot.command_manager.send_response.assert_awaited_once()
+        call = bot.command_manager.send_response.await_args
+        assert call.args[0].reply_scope == "#pl-mz"
+        assert call.args[1] == "sunny"
+        assert call.kwargs["command_id"].startswith("keyword_wx_alice_")
+
+
+# ---------------------------------------------------------------------------
+# handle_new_contact — auto_manage_contacts (companion path)
+# ---------------------------------------------------------------------------
+
+
+class _NewContactEvent:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+
+def _companion_contact_payload() -> dict:
+    pk = "ab" * 32
+    return {
+        "public_key": pk,
+        "adv_name": "Alice",
+        "name": "Alice",
+        "type": 1,
+        "flags": 0,
+        "out_path": "",
+        "out_path_len": 0,
+        "out_path_hash_mode": 0,
+    }
+
+
+@pytest.fixture
+def new_contact_env(mock_logger):
+    """Bot + MessageHandler with mocked repeater_manager and meshcore for NEW_CONTACT tests."""
+    bot = Mock()
+    bot.logger = mock_logger
+    bot.config = configparser.ConfigParser()
+    bot.config.add_section("Bot")
+    bot.config.set("Bot", "enabled", "true")
+    bot.config.set("Bot", "rf_data_timeout", "15.0")
+    bot.config.set("Bot", "message_correlation_timeout", "10.0")
+    bot.config.set("Bot", "enable_enhanced_correlation", "true")
+    bot.config.add_section("Channels")
+    bot.config.set("Channels", "respond_to_dms", "true")
+    bot.connection_time = None
+    bot.prefix_hex_chars = 8
+    bot.command_manager = Mock()
+    bot.command_manager.monitor_channels = ["general"]
+    bot.command_manager.is_user_banned = Mock(return_value=False)
+    bot.command_manager.commands = {}
+
+    handler = MessageHandler(bot)
+    bot.message_handler = handler
+
+    rm = Mock()
+    from modules.repeater_manager import TrackAdvertResult
+
+    rm.track_contact_advertisement = AsyncMock(
+        return_value=TrackAdvertResult(ok=True, duplicate_packet=False)
+    )
+    rm.check_and_auto_purge = AsyncMock()
+    rm.get_contact_list_status = AsyncMock(
+        return_value={
+            "is_near_limit": False,
+            "usage_percentage": 10.0,
+            "current_contacts": 5,
+            "estimated_limit": 300,
+        }
+    )
+    rm.manage_contact_list = AsyncMock(return_value={"success": True})
+    rm.add_companion_from_contact_data = AsyncMock(return_value=True)
+    rm.log_purging_action = Mock()
+    rm.db_manager = Mock()
+    rm.db_manager.execute_update = Mock()
+    rm._is_repeater_device = Mock(return_value=False)
+    bot.repeater_manager = rm
+
+    mesh = Mock()
+    mesh.commands = Mock()
+    mesh.commands.add_contact = AsyncMock()
+    bot.meshcore = mesh
+
+    return bot, handler, rm, mesh
+
+
+@pytest.mark.asyncio
+class TestHandleNewContactAutoManage:
+    async def test_manual_mode_no_device_add(self, new_contact_env):
+        bot, handler, rm, mesh = new_contact_env
+        bot.config.set("Bot", "auto_manage_contacts", "false")
+        ev = _NewContactEvent(_companion_contact_payload())
+        await handler.handle_new_contact(ev, None)
+        rm.track_contact_advertisement.assert_awaited_once()
+        mesh.commands.add_contact.assert_not_called()
+        rm.add_companion_from_contact_data.assert_not_called()
+        rm.log_purging_action.assert_called_once()
+
+    async def test_device_mode_no_bot_add_contact(self, new_contact_env):
+        bot, handler, rm, mesh = new_contact_env
+        bot.config.set("Bot", "auto_manage_contacts", "device")
+        ev = _NewContactEvent(_companion_contact_payload())
+        await handler.handle_new_contact(ev, None)
+        rm.track_contact_advertisement.assert_awaited_once()
+        mesh.commands.add_contact.assert_not_called()
+        rm.add_companion_from_contact_data.assert_not_called()
+        rm.get_contact_list_status.assert_awaited()
+
+    async def test_bot_mode_uses_add_companion_from_contact_data(self, new_contact_env):
+        bot, handler, rm, mesh = new_contact_env
+        bot.config.set("Bot", "auto_manage_contacts", "bot")
+        ev = _NewContactEvent(_companion_contact_payload())
+        await handler.handle_new_contact(ev, None)
+        rm.add_companion_from_contact_data.assert_awaited_once()
+        mesh.commands.add_contact.assert_not_called()
+
+    async def test_bot_mode_skips_add_when_duplicate_packet_hash(self, new_contact_env):
+        from modules.repeater_manager import TrackAdvertResult
+
+        bot, handler, rm, mesh = new_contact_env
+        bot.config.set("Bot", "auto_manage_contacts", "bot")
+        rm.track_contact_advertisement = AsyncMock(
+            return_value=TrackAdvertResult(ok=True, duplicate_packet=True)
+        )
+        ev = _NewContactEvent(_companion_contact_payload())
+        await handler.handle_new_contact(ev, None)
+        rm.track_contact_advertisement.assert_awaited_once()
+        rm.add_companion_from_contact_data.assert_not_called()
+        rm.get_contact_list_status.assert_not_awaited()
+
+    async def test_bot_mode_two_events_first_unique_then_duplicate_adds_once(self, new_contact_env):
+        from modules.repeater_manager import TrackAdvertResult
+
+        bot, handler, rm, mesh = new_contact_env
+        bot.config.set("Bot", "auto_manage_contacts", "bot")
+        rm.track_contact_advertisement = AsyncMock(
+            side_effect=[
+                TrackAdvertResult(ok=True, duplicate_packet=False),
+                TrackAdvertResult(ok=True, duplicate_packet=True),
+            ]
+        )
+        ev = _NewContactEvent(_companion_contact_payload())
+        await handler.handle_new_contact(ev, None)
+        await handler.handle_new_contact(ev, None)
+        assert rm.track_contact_advertisement.await_count == 2
+        rm.add_companion_from_contact_data.assert_awaited_once()

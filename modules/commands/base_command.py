@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, Optional
 
-from ..models import MeshMessage
+from ..models import CHANNEL_REGIONAL_FLOOD_SCOPE_BODY_OVERHEAD, MeshMessage
 from ..security_utils import validate_pubkey_format
 from ..utils import format_elapsed_display, get_config_timezone
 
@@ -505,20 +505,33 @@ class BaseCommand(ABC):
             'module_name': self.__class__.__module__
         }
 
-    async def send_response(self, message: MeshMessage, content: str, skip_user_rate_limit: bool = False) -> bool:
+    async def send_response(
+        self,
+        message: MeshMessage,
+        content: str,
+        skip_user_rate_limit: bool = False,
+        *,
+        command_id: str | None = None,
+    ) -> bool:
         """Unified method for sending responses to users.
 
         Args:
             message: The message to respond to.
             content: The response content.
             skip_user_rate_limit: If True, skip the user rate limiter check (for automated responses).
+            command_id: Optional id for repeat/transmission tracking.
 
         Returns:
             bool: True if the response was sent successfully, False otherwise.
         """
         try:
             # Use the command manager's send_response method to ensure response capture
-            return await self.bot.command_manager.send_response(message, content, skip_user_rate_limit=skip_user_rate_limit)
+            return await self.bot.command_manager.send_response(
+                message,
+                content,
+                skip_user_rate_limit=skip_user_rate_limit,
+                command_id=command_id,
+            )
         except Exception as e:
             self.logger.error(f"Failed to send response: {e}")
             return False
@@ -549,6 +562,7 @@ class BaseCommand(ABC):
 
         Channel messages are formatted as "<username>: <message>", so the body budget is:
         160 - utf8_byte_len(username) - 2 (for ": "), matching firmware cipher block limits.
+        Regional (non-global) flood scope subtracts CHANNEL_REGIONAL_FLOOD_SCOPE_BODY_OVERHEAD bytes.
 
         DM (contact) messages have no username prefix; max safe payload is 158 bytes.
 
@@ -584,11 +598,10 @@ class BaseCommand(ABC):
 
         # 160 bytes are available for channel messages
         # Calculate max length: 160 - username_length - 2 (for ": ")
-        max_length = 160 - len(str(username).encode('utf-8')) - 2
-
-        # Ensure we don't return a negative or unreasonably small value
-        # Minimum of 130 bytes to ensure some functionality
-        return max(130, max_length)
+        max_length = max(130, 160 - len(str(username).encode('utf-8')) - 2)
+        if not MeshMessage.is_global_flood_scope(message.effective_outgoing_flood_scope(self.bot)):
+            max_length -= CHANNEL_REGIONAL_FLOOD_SCOPE_BODY_OVERHEAD
+        return max_length
 
     def check_cooldown(self, user_id: Optional[str] = None) -> tuple[bool, float]:
         """Check if user is on cooldown.
@@ -802,6 +815,42 @@ class BaseCommand(ABC):
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
         return cleaned
 
+    def cleanup_message_for_matching(self, message: MeshMessage) -> str:
+        """Clean up message text before keyword checking.
+
+        Strips the command prefix and, when respond_to_mentions is not 'false',
+        validates mention rules and strips all @[...] mentions. Also updates
+        message.content and message.content_lower with the cleaned text so that
+        downstream processing (the execute step) sees the same clean content.
+
+        Args:
+            message: The incoming message.
+
+        Returns:
+            str: Cleaned, lowercased content ready for keyword comparison,
+                 or empty string if the message should be ignored (wrong prefix,
+                 or mentions present but bot not among them).
+        """
+        content = message.content.strip()
+
+        if self._command_prefix:
+            if not content.startswith(self._command_prefix):
+                return ""
+            content = content[len(self._command_prefix):].strip()
+        else:
+            if content.startswith('!'):
+                content = content[1:].strip()
+
+        mention_mode = self.bot.config.get('Bot', 'respond_to_mentions', fallback='also').strip().lower()
+        if mention_mode != 'false':
+            if not self._check_mentions_ok(content):
+                return ""
+            content = self._strip_mentions(content)
+
+        message.content = content
+        message.content_lower = content.lower()
+        return message.content_lower
+
     def matches_keyword(self, message: MeshMessage) -> bool:
         """Check if this command matches the message content based on keywords.
 
@@ -819,27 +868,9 @@ class BaseCommand(ABC):
         if not self.keywords:
             return False
 
-        content = message.content.strip()
-
-        # Check for command prefix if configured
-        if self._command_prefix:
-            # If prefix is configured, message must start with it
-            if not content.startswith(self._command_prefix):
-                return False
-            # Strip the prefix
-            content = content[len(self._command_prefix):].strip()
-        else:
-            # If no prefix configured, strip legacy "!" prefix for backward compatibility
-            if content.startswith('!'):
-                content = content[1:].strip()
-
-        # Check if mentions are valid (bot must be mentioned if any mentions exist)
-        if not self._check_mentions_ok(content):
+        content_lower = self.cleanup_message_for_matching(message)
+        if not content_lower:
             return False
-
-        # Strip @[username] mentions before checking keywords
-        content = self._strip_mentions(content)
-        content_lower = content.lower()
 
         for keyword in self.keywords:
             keyword_lower = keyword.lower()
@@ -900,6 +931,106 @@ class BaseCommand(ABC):
     def can_execute_now(self, message: MeshMessage) -> bool:
         """Check if this command can execute right now (permissions, cooldown, etc.)"""
         return self.can_execute(message)
+
+    def _get_required_path_bytes_setting(self, section: str) -> int:
+        """Return normalized path-byte requirement for a command section.
+
+        Supported values:
+        - 0/1: allow all
+        - 2: require >= 2 bytes
+        - 3: require exactly 3 bytes
+        """
+        required = self.get_config_value(
+            section,
+            'require_path_bytes_greater_or_equal_to',
+            fallback=0,
+            value_type='int',
+        )
+        if required in (0, 1, 2, 3):
+            return required
+        self.logger.warning(
+            f"Invalid {section}.require_path_bytes_greater_or_equal_to={required}; defaulting to 0"
+        )
+        return 0
+
+    def _path_bytes_match_requirement(self, path_byte_length: int, required_path_bytes: int) -> bool:
+        """Check whether path byte length satisfies configured requirement."""
+        if required_path_bytes in (0, 1):
+            return True
+        if required_path_bytes == 2:
+            return path_byte_length >= 2
+        if required_path_bytes == 3:
+            return path_byte_length == 3
+        return True
+
+    def _get_message_path_byte_length(self, message: MeshMessage) -> int:
+        """Best-effort extraction of message path byte length from routing/path data."""
+        routing_info = getattr(message, 'routing_info', None)
+        if routing_info:
+            raw_path_byte_length = routing_info.get('path_byte_length')
+            if isinstance(raw_path_byte_length, int) and raw_path_byte_length >= 0:
+                return raw_path_byte_length
+
+            bytes_per_hop = routing_info.get('bytes_per_hop')
+            path_length = routing_info.get('path_length')
+            if (
+                isinstance(bytes_per_hop, int)
+                and bytes_per_hop >= 0
+                and isinstance(path_length, int)
+                and path_length >= 0
+            ):
+                return bytes_per_hop * path_length
+
+            path_nodes = routing_info.get('path_nodes') or []
+            if path_nodes:
+                total = 0
+                for node in path_nodes:
+                    node_str = str(node).strip()
+                    if not node_str:
+                        continue
+                    total += len(node_str) // 2
+                return total
+
+        path_string = (getattr(message, 'path', None) or '').strip()
+        if not path_string:
+            return 0
+        if " via ROUTE_TYPE_" in path_string:
+            path_string = path_string.split(" via ROUTE_TYPE_")[0]
+        if "Direct" in path_string or "0 hops" in path_string:
+            return 0
+        path_string = re.sub(r'\s*\([^)]*hops?[^)]*\)', '', path_string, flags=re.IGNORECASE).strip()
+        if not path_string:
+            return 0
+        if ',' in path_string:
+            tokens = [t.strip() for t in path_string.split(',') if t.strip()]
+            if tokens:
+                return sum(len(t) // 2 for t in tokens)
+        return len(path_string) // 2
+
+    def _get_required_path_bytes_failure_response(self, section: str) -> Optional[str]:
+        """Get optional response text used when path-byte requirement fails."""
+        failure_response = self.get_config_value(
+            section,
+            'require_path_bytes_failure_response',
+            fallback='',
+            value_type='str',
+        )
+        if not failure_response:
+            return None
+        cleaned = self._strip_quotes_from_config(failure_response).strip()
+        return cleaned or None
+
+    async def enforce_path_byte_requirement(self, message: MeshMessage, section: str) -> bool:
+        """Apply path-byte requirement; optionally send configured failure response."""
+        required = self._get_required_path_bytes_setting(section)
+        path_byte_length = self._get_message_path_byte_length(message)
+        if self._path_bytes_match_requirement(path_byte_length, required):
+            return True
+
+        failure_response = self._get_required_path_bytes_failure_response(section)
+        if failure_response:
+            await self.send_response(message, failure_response)
+        return False
 
     def get_path_display_string(self, message: MeshMessage) -> str:
         """Get path string for display (test/ack placeholders). Prefers message.routing_info for multi-byte and direct."""

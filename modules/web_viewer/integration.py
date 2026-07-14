@@ -19,6 +19,29 @@ from typing import Optional
 from ..utils import resolve_path
 
 
+def normalized_web_viewer_password(config) -> str:
+    """Return the effective web viewer password, or '' to disable the login screen.
+
+    Blank values, quoted empties (e.g. INI ``""``), and placeholders ``none`` / ``null`` /
+    ``nil`` (case-insensitive) are treated as no password.
+    """
+    if not config.has_section("Web_Viewer"):
+        return ""
+    raw = config.get("Web_Viewer", "web_viewer_password", fallback="")
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        s = s[1:-1].strip()
+    if not s:
+        return ""
+    if s.lower() in ("none", "null", "nil"):
+        return ""
+    return s
+
+
 class BotIntegration:
     """Simple bot integration for web viewer compatibility"""
 
@@ -29,16 +52,36 @@ class BotIntegration:
     # How often (seconds) the drain thread flushes the write queue
     DRAIN_INTERVAL = 0.5
 
+    # Bounded packet_stream write queue: producers block up to this long before drop/retry.
+    _WRITE_QUEUE_PUT_TIMEOUT_SEC = 5.0
+    EDGE_POST_TIMEOUT_SEC = 1.0
+    NODE_POST_TIMEOUT_SEC = 0.5
+    SQLITE_CONNECT_TIMEOUT_SEC = 60.0
+    REQUEUE_PUT_TIMEOUT_SEC = 60.0
+    SHUTDOWN_JOIN_TIMEOUT_SEC = 5.0
+
     def __init__(self, bot):
         self.bot = bot
         self.circuit_breaker_open = False
         self.circuit_breaker_failures = 0
         self.circuit_breaker_last_failure_time = 0.0
         self.is_shutting_down = False
-        # Batched write queue: avoids a per-insert sqlite3.connect() round-trip
-        self._write_queue: queue.Queue = queue.Queue()
+        # Serialize flushes so drain thread, shutdown, and producer retry cannot interleave.
+        self._flush_lock = threading.Lock()
+        maxsize = 1000
+        if self.bot.config.has_section("Web_Viewer"):
+            try:
+                maxsize = self.bot.config.getint(
+                    "Web_Viewer", "packet_stream_write_queue_max", fallback=1000
+                )
+            except (ValueError, TypeError, OSError):
+                maxsize = 1000
+        self._write_queue_maxsize = max(1, int(maxsize))
+        # Batched write queue: avoids a per-insert sqlite3.connect() round-trip (bounded for RAM).
+        self._write_queue: queue.Queue = queue.Queue(maxsize=self._write_queue_maxsize)
         self._drain_stop = threading.Event()
         self._drain_thread: Optional[threading.Thread] = None
+        self._load_timeouts_from_config()
         # Initialize HTTP session with connection pooling for efficient reuse
         self._init_http_session()
         # Generate a shared secret for authenticating internal /api/stream_data calls.
@@ -52,6 +95,33 @@ class BotIntegration:
             self.http_session.headers['X-Stream-Token'] = self._stream_token
         # Start background drain thread after table is confirmed to exist
         self._start_drain_thread()
+
+    def _get_float_config(self, key: str, fallback: float) -> float:
+        """Read float from [Web_Viewer] config with sane fallback."""
+        try:
+            value = self.bot.config.getfloat("Web_Viewer", key, fallback=fallback)
+            return value if value > 0 else fallback
+        except (ValueError, TypeError, OSError):
+            return fallback
+
+    def _load_timeouts_from_config(self) -> None:
+        """Load optional BotIntegration timeout settings from config."""
+        self.edge_post_timeout_sec = self._get_float_config(
+            "edge_post_timeout_sec", self.EDGE_POST_TIMEOUT_SEC
+        )
+        self.node_post_timeout_sec = self._get_float_config(
+            "node_post_timeout_sec", self.NODE_POST_TIMEOUT_SEC
+        )
+        self.sqlite_connect_timeout_sec = self._get_float_config(
+            "sqlite_connect_timeout_sec", self.SQLITE_CONNECT_TIMEOUT_SEC
+        )
+        self.requeue_put_timeout_sec = self._get_float_config(
+            "requeue_put_timeout_sec", self.REQUEUE_PUT_TIMEOUT_SEC
+        )
+        self.shutdown_join_timeout_sec = self._get_float_config(
+            "integration_shutdown_join_timeout_sec",
+            self.SHUTDOWN_JOIN_TIMEOUT_SEC,
+        )
 
     def _init_http_session(self):
         """Initialize a requests.Session with connection pooling and keep-alive"""
@@ -151,7 +221,7 @@ class BotIntegration:
             import sqlite3
 
             db_path = self._get_web_viewer_db_path()
-            with closing(sqlite3.connect(str(db_path), timeout=60.0)) as conn:
+            with closing(sqlite3.connect(str(db_path), timeout=self.sqlite_connect_timeout_sec)) as conn:
                 cur = conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='packet_stream'"
                 )
@@ -206,44 +276,80 @@ class BotIntegration:
             self._drain_stop.wait(timeout=self.DRAIN_INTERVAL)
             self._flush_write_queue()
 
+    def _requeue_rows(self, rows: list[tuple[float, str, str]]) -> None:
+        """Restore rows to the queue after a failed flush (FIFO). Logs if the queue stays full."""
+        for i, row in enumerate(rows):
+            try:
+                self._write_queue.put(row, timeout=self.requeue_put_timeout_sec)
+            except queue.Full:
+                remaining = len(rows) - i
+                self.bot.logger.error(
+                    "packet_stream: could not re-queue %d row(s) after flush failure; data may be lost",
+                    remaining,
+                )
+                break
+
     def _flush_write_queue(self) -> None:
         """Drain all queued rows and insert them in a single batched transaction."""
         import sqlite3
-        if self._write_queue.empty():
-            return
-        rows = []
-        while not self._write_queue.empty():
-            try:
-                rows.append(self._write_queue.get_nowait())
-            except queue.Empty:
-                break
-        if not rows:
-            return
-        db_path = self._get_web_viewer_db_path()
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                with closing(sqlite3.connect(str(db_path), timeout=60.0)) as conn:
-                    conn.executemany(
-                        'INSERT INTO packet_stream (timestamp, data, type) VALUES (?, ?, ?)',
-                        rows,
+
+        with self._flush_lock:
+            if self._write_queue.empty():
+                return
+            rows: list[tuple[float, str, str]] = []
+            while not self._write_queue.empty():
+                try:
+                    rows.append(self._write_queue.get_nowait())
+                except queue.Empty:
+                    break
+            if not rows:
+                return
+            db_path = self._get_web_viewer_db_path()
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    with closing(sqlite3.connect(str(db_path), timeout=self.sqlite_connect_timeout_sec)) as conn:
+                        conn.executemany(
+                            'INSERT INTO packet_stream (timestamp, data, type) VALUES (?, ?, ?)',
+                            rows,
+                        )
+                        conn.commit()
+                    return
+                except sqlite3.OperationalError as e:
+                    if "locked" in str(e).lower() and attempt < max_retries - 1:
+                        time.sleep(0.15 * (attempt + 1))
+                        continue
+                    self.bot.logger.warning(
+                        f"Error flushing packet_stream queue ({len(rows)} rows): {e}"
                     )
-                    conn.commit()
-                return
-            except sqlite3.OperationalError as e:
-                if "locked" in str(e).lower() and attempt < max_retries - 1:
-                    time.sleep(0.15 * (attempt + 1))
-                    continue
-                self.bot.logger.warning(f"Error flushing packet_stream queue ({len(rows)} rows): {e}")
-                return
-            except Exception as e:
-                self.bot.logger.warning(f"Error flushing packet_stream queue ({len(rows)} rows): {e}")
-                return
+                    self._requeue_rows(rows)
+                    return
+                except Exception as e:
+                    self.bot.logger.warning(
+                        f"Error flushing packet_stream queue ({len(rows)} rows): {e}"
+                    )
+                    self._requeue_rows(rows)
+                    return
 
     def _insert_packet_stream_row(self, data_json: str, row_type: str, log_prefix: str = "packet data"):
         """Queue one row for batched insertion into packet_stream by the drain thread."""
+        item = (time.time(), data_json, row_type)
         try:
-            self._write_queue.put_nowait((time.time(), data_json, row_type))
+            self._write_queue.put(item, timeout=self._WRITE_QUEUE_PUT_TIMEOUT_SEC)
+        except queue.Full:
+            try:
+                self._flush_write_queue()
+            except Exception as e:
+                self.bot.logger.debug("packet_stream flush after full queue: %s", e)
+            try:
+                self._write_queue.put(item, timeout=self._WRITE_QUEUE_PUT_TIMEOUT_SEC)
+            except queue.Full:
+                self.bot.logger.warning(
+                    "packet_stream write queue full (%s/%s items) after flush retry; dropping %s",
+                    self._write_queue.qsize(),
+                    self._write_queue.maxsize,
+                    log_prefix,
+                )
         except Exception as e:
             self.bot.logger.warning(f"Error queuing {log_prefix} for web viewer: {e}")
 
@@ -378,7 +484,7 @@ class BotIntegration:
             cutoff_time = time.time() - (days_to_keep * 24 * 60 * 60)
 
             db_path = self._get_web_viewer_db_path()
-            with closing(sqlite3.connect(str(db_path), timeout=60.0)) as conn:
+            with closing(sqlite3.connect(str(db_path), timeout=self.sqlite_connect_timeout_sec)) as conn:
                 cursor = conn.cursor()
 
                 # Clean up old packet stream data
@@ -440,14 +546,14 @@ class BotIntegration:
             }
             if self.http_session:
                 try:
-                    self.http_session.post(url, json=payload, timeout=1.0)
+                    self.http_session.post(url, json=payload, timeout=self.edge_post_timeout_sec)
                     self._record_web_viewer_result(True)
                 except Exception:
                     self._record_web_viewer_result(False)
             else:
                 import requests
                 try:
-                    requests.post(url, json=payload, timeout=1.0, headers=headers)
+                    requests.post(url, json=payload, timeout=self.edge_post_timeout_sec, headers=headers)
                     self._record_web_viewer_result(True)
                 except Exception:
                     self._record_web_viewer_result(False)
@@ -475,7 +581,7 @@ class BotIntegration:
                 'X-Requested-With': 'BotIntegration',
             }
             try:
-                requests.post(url, json=payload, timeout=0.5, headers=headers)
+                requests.post(url, json=payload, timeout=self.node_post_timeout_sec, headers=headers)
                 self._record_web_viewer_result(True)
             except Exception:
                 self._record_web_viewer_result(False)
@@ -488,7 +594,7 @@ class BotIntegration:
         # Stop drain thread and do a final flush of any queued rows
         self._drain_stop.set()
         if self._drain_thread and self._drain_thread.is_alive():
-            self._drain_thread.join(timeout=5.0)
+            self._drain_thread.join(timeout=self.shutdown_join_timeout_sec)
         self._flush_write_queue()
         # Close HTTP session to clean up connections
         if hasattr(self, 'http_session') and self.http_session:
@@ -500,6 +606,10 @@ class WebViewerIntegration:
 
     # Whitelist of allowed host bindings for security
     ALLOWED_HOSTS = ['127.0.0.1', 'localhost', '0.0.0.0']
+    VIEWER_STOP_GRACE_TIMEOUT_SEC = 5.0
+    VIEWER_STOP_FORCE_TIMEOUT_SEC = 2.0
+    PORT_CLEANUP_LSOF_TIMEOUT_SEC = 5.0
+    PORT_CLEANUP_KILL_TIMEOUT_SEC = 2.0
 
     def __init__(self, bot):
         self.bot = bot
@@ -518,6 +628,22 @@ class WebViewerIntegration:
         self.port = bot.config.getint('Web_Viewer', 'port', fallback=8080)  # Web viewer uses 8080
         self.debug = bot.config.getboolean('Web_Viewer', 'debug', fallback=False)
         self.auto_start = bot.config.getboolean('Web_Viewer', 'auto_start', fallback=False)
+        self.viewer_stop_grace_timeout_sec = self._get_float_config(
+            "viewer_stop_grace_timeout_sec",
+            self.VIEWER_STOP_GRACE_TIMEOUT_SEC,
+        )
+        self.viewer_stop_force_timeout_sec = self._get_float_config(
+            "viewer_stop_force_timeout_sec",
+            self.VIEWER_STOP_FORCE_TIMEOUT_SEC,
+        )
+        self.port_cleanup_lsof_timeout_sec = self._get_float_config(
+            "port_cleanup_lsof_timeout_sec",
+            self.PORT_CLEANUP_LSOF_TIMEOUT_SEC,
+        )
+        self.port_cleanup_kill_timeout_sec = self._get_float_config(
+            "port_cleanup_kill_timeout_sec",
+            self.PORT_CLEANUP_KILL_TIMEOUT_SEC,
+        )
 
         # Validate configuration for security
         self._validate_config()
@@ -526,12 +652,22 @@ class WebViewerIntegration:
         self.restart_count = 0
         self.max_restarts = 5
         self.last_restart = 0
+        # True while stop_viewer() is tearing down; blocks accidental restart during bot shutdown
+        self.shutting_down = False
 
         # Initialize bot integration for compatibility
         self.bot_integration = BotIntegration(bot)
 
         if self.enabled and self.auto_start:
             self.start_viewer()
+
+    def _get_float_config(self, key: str, fallback: float) -> float:
+        """Read float timeout from [Web_Viewer] with positive-value guard."""
+        try:
+            value = self.bot.config.getfloat("Web_Viewer", key, fallback=fallback)
+            return value if value > 0 else fallback
+        except (ValueError, TypeError, OSError):
+            return fallback
 
     def _validate_config(self):
         """Validate web viewer configuration for security"""
@@ -548,14 +684,15 @@ class WebViewerIntegration:
                 f"Port must be between 1024-65535 (non-privileged), got: {self.port}"
             )
 
-        # Enforce authentication when binding to non-loopback interfaces
-        if self.host == '0.0.0.0':
-            password = self.bot.config.get('Web_Viewer', 'web_viewer_password', fallback='').strip()
-            if not password:
-                raise ValueError(
-                    "web_viewer_password must be set in [Web_Viewer] config when "
-                    "binding to all interfaces (host = 0.0.0.0). "
-                    "For unauthenticated local-only access, use host = 127.0.0.1."
+        # Insecure but allowed: binding to all interfaces without a password.
+        # Only warn when the web viewer is configured to run at startup.
+        if self.enabled and self.host == "0.0.0.0":
+            if not normalized_web_viewer_password(self.bot.config):
+                self.logger.error(
+                    "Web viewer is configured with host = 0.0.0.0 and no "
+                    "web_viewer_password (or password is empty/null); the UI is reachable "
+                    "from the network without authentication. Set web_viewer_password or use "
+                    "host = 127.0.0.1 for local-only access."
                 )
 
     def start_viewer(self):
@@ -563,6 +700,9 @@ class WebViewerIntegration:
         if self.running:
             self.logger.warning("Web viewer is already running")
             return
+
+        # Intentional (re)start after stop_viewer / restart_viewer — allow monitor thread to run
+        self.shutting_down = False
 
         try:
             # Start the web viewer
@@ -580,6 +720,7 @@ class WebViewerIntegration:
             return
 
         try:
+            self.shutting_down = True
             self.running = False
 
             if self.viewer_process and self.viewer_process.poll() is None:
@@ -587,13 +728,13 @@ class WebViewerIntegration:
                 try:
                     # First try graceful termination
                     self.viewer_process.terminate()
-                    self.viewer_process.wait(timeout=5)
+                    self.viewer_process.wait(timeout=self.viewer_stop_grace_timeout_sec)
                     self.logger.info("Web viewer stopped gracefully")
                 except subprocess.TimeoutExpired:
                     self.logger.warning("Web viewer did not stop gracefully, forcing termination")
                     try:
                         self.viewer_process.kill()
-                        self.viewer_process.wait(timeout=2)
+                        self.viewer_process.wait(timeout=self.viewer_stop_force_timeout_sec)
                     except subprocess.TimeoutExpired:
                         self.logger.error("Failed to kill web viewer process")
                     except Exception as e:
@@ -626,7 +767,7 @@ class WebViewerIntegration:
             # Additional cleanup: kill any remaining processes on the port
             try:
                 result = subprocess.run(['lsof', '-ti', f':{self.port}'],
-                                      capture_output=True, text=True, timeout=5)
+                                      capture_output=True, text=True, timeout=self.port_cleanup_lsof_timeout_sec)
                 if result.returncode == 0 and result.stdout.strip():
                     pids = result.stdout.strip().split('\n')
                     for pid in pids:
@@ -646,7 +787,7 @@ class WebViewerIntegration:
                                 self.logger.warning(f"Refusing to kill system PID: {pid}")
                                 continue
 
-                            subprocess.run(['kill', '-9', str(pid_int)], timeout=2)
+                            subprocess.run(['kill', '-9', str(pid_int)], timeout=self.port_cleanup_kill_timeout_sec)
                             self.logger.info(f"Killed remaining process {pid} on port {self.port}")
                         except (ValueError, subprocess.TimeoutExpired) as e:
                             self.logger.warning(f"Failed to kill process {pid}: {e}")
@@ -750,6 +891,25 @@ class WebViewerIntegration:
             while self.running and self.viewer_process and self.viewer_process.poll() is None:
                 time.sleep(1)
 
+            # Process exited unexpectedly — try to restart if we haven't been stopped
+            if self.running and self.viewer_process and self.viewer_process.poll() is not None:
+                if (
+                    self.shutting_down
+                    or self.bot._shutdown_event.is_set()
+                    or not getattr(self.bot, "connected", True)
+                ):
+                    self.logger.debug(
+                        "Web viewer process exited (code %s) during bot shutdown; not restarting",
+                        self.viewer_process.returncode,
+                    )
+                    return
+                self.logger.warning(
+                    "Web viewer process exited unexpectedly (code %s) — attempting restart",
+                    self.viewer_process.returncode,
+                )
+                self.restart_viewer()
+                return
+
             # Process exited - read from log files for error reporting if needed
             if self.viewer_process and self.viewer_process.returncode != 0:
                 stdout_file.flush()
@@ -805,6 +965,13 @@ class WebViewerIntegration:
 
     def restart_viewer(self):
         """Restart the web viewer with rate limiting"""
+        if self.shutting_down:
+            return
+        if getattr(self.bot, "_shutdown_event", None) is not None and self.bot._shutdown_event.is_set():
+            return
+        if not getattr(self.bot, "connected", True):
+            return
+
         current_time = time.time()
 
         # Rate limit restarts to prevent restart loops

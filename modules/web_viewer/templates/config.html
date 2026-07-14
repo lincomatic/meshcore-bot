@@ -10,26 +10,32 @@
         grid-template-columns: 260px minmax(0, 1fr);
         gap: 1rem;
     }
-    .config-nav.card {
+    .config-nav.card,
+    .config-admin-tools.card {
         border: 1px solid var(--border-color);
         background-color: var(--card-bg);
+        border-left: 3px solid #0d6efd;
     }
-    .config-nav {
+    [data-theme="dark"] .config-nav.card,
+    [data-theme="dark"] .config-admin-tools.card {
+        border-left-color: #6ea8fe;
+    }
+    .config-sidebar {
         position: sticky;
         top: 1rem;
         align-self: start;
         max-height: calc(100vh - 2rem);
         overflow-y: auto;
     }
-    .config-nav .nav-link {
+    .config-sidebar .nav-link {
         color: var(--text-color);
         border-radius: 0.375rem;
     }
-    .config-nav .nav-link:hover,
-    .config-nav .nav-link:focus {
+    .config-sidebar .nav-link:hover,
+    .config-sidebar .nav-link:focus {
         background-color: var(--bg-secondary);
     }
-    .config-nav .nav-link.active {
+    .config-sidebar .nav-link.active {
         background-color: var(--bg-tertiary);
         font-weight: 600;
     }
@@ -147,7 +153,7 @@
         .config-layout {
             grid-template-columns: 1fr;
         }
-        .config-nav {
+        .config-sidebar {
             position: static;
             max-height: none;
         }
@@ -161,25 +167,42 @@
         <i class="fas fa-cog"></i> Configuration
     </h1>
     <div class="config-layout">
-        <aside class="config-nav card">
-            <div class="card-body p-3">
-                {% for category_key, category_label in panel_categories %}
-                {% set category_panels = config_panels | selectattr('category', 'equalto', category_key) | list %}
-                {% if category_panels %}
-                <div class="mb-3">
+        <aside class="config-sidebar d-flex flex-column gap-3">
+            <div class="config-nav card">
+                <div class="card-body p-3">
+                    {% for category_key, category_label in panel_categories %}
+                    {% set category_panels = config_panels | selectattr('category', 'equalto', category_key) | list %}
+                    {% if category_panels %}
+                    <div class="mb-3">
+                        <h6 class="text-uppercase text-muted fw-semibold mb-2" style="font-size:.75rem;letter-spacing:.05em;">
+                            {{ category_label }}
+                        </h6>
+                        <nav class="nav flex-column">
+                            {% for panel in category_panels %}
+                            <a class="nav-link px-2 py-1" href="#{{ panel.id }}" data-config-target="{{ panel.id }}">
+                                <i class="{{ panel.icon }} me-2"></i>{{ panel.title }}
+                            </a>
+                            {% endfor %}
+                        </nav>
+                    </div>
+                    {% endif %}
+                    {% endfor %}
+                </div>
+            </div>
+            <div class="config-admin-tools card">
+                <div class="card-body p-3">
                     <h6 class="text-uppercase text-muted fw-semibold mb-2" style="font-size:.75rem;letter-spacing:.05em;">
-                        {{ category_label }}
+                        Admin Tools
                     </h6>
                     <nav class="nav flex-column">
-                        {% for panel in category_panels %}
-                        <a class="nav-link px-2 py-1" href="#{{ panel.id }}" data-config-target="{{ panel.id }}">
-                            <i class="{{ panel.icon }} me-2"></i>{{ panel.title }}
+                        <a class="nav-link px-2 py-1" href="/api-explorer">
+                            <i class="fas fa-plug me-2"></i>API
                         </a>
-                        {% endfor %}
+                        <a class="nav-link px-2 py-1" href="/admin/config">
+                            <i class="fas fa-file-code me-2"></i>Raw Config
+                        </a>
                     </nav>
                 </div>
-                {% endif %}
-                {% endfor %}
             </div>
         </aside>
         <main>
@@ -519,6 +542,267 @@ class ConfigManager {
 
     hideStatus() {
         this.saveStatus.style.display = 'none';
+    }
+}
+
+// ── Radio Reliability ────────────────────────────────────────────────────────
+class RadioReliabilityManager {
+    constructor() {
+        this.zombieEnabledEl = document.getElementById('zombie-alert-enabled-toggle');
+        this.zombieEmailEl = document.getElementById('zombie-alert-email');
+        this.zombieIniEl = document.getElementById('zombie-alert-ini-summary');
+        this.zombieSaveBtn = document.getElementById('save-zombie-alert-btn');
+        this.zombieSaveConfigBtn = document.getElementById('save-zombie-alert-config-btn');
+        this.zombieStatusEl = document.getElementById('zombie-alert-status');
+
+        this.debugEnabledEl = document.getElementById('radio-debug-enabled-toggle');
+        this.debugIniEl = document.getElementById('radio-debug-ini-summary');
+        this.debugSaveBtn = document.getElementById('save-radio-debug-btn');
+        this.debugSaveConfigBtn = document.getElementById('save-radio-debug-config-btn');
+        this.debugApplyBtn = document.getElementById('apply-radio-debug-btn');
+        this.debugStatusEl = document.getElementById('radio-debug-status');
+
+        this.probeIntervalEl = document.getElementById('radio-probe-interval');
+        this.probeFailThresholdEl = document.getElementById('radio-probe-fail-threshold');
+        this.probeIniEl = document.getElementById('radio-probe-ini-summary');
+        this.probeSaveBtn = document.getElementById('save-radio-probe-btn');
+        this.probeSaveConfigBtn = document.getElementById('save-radio-probe-config-btn');
+        this.probeStatusEl = document.getElementById('radio-probe-status');
+
+        this.offlineThresholdEl = document.getElementById('radio-offline-threshold');
+        this.offlineAlertEnabledEl = document.getElementById('radio-offline-alert-enabled-toggle');
+        this.offlineAlertEmailEl = document.getElementById('radio-offline-alert-email');
+        this.offlineIniEl = document.getElementById('radio-offline-ini-summary');
+        this.offlineSaveBtn = document.getElementById('save-radio-offline-btn');
+        this.offlineSaveConfigBtn = document.getElementById('save-radio-offline-config-btn');
+        this.offlineStatusEl = document.getElementById('radio-offline-status');
+
+        if (!this.zombieEnabledEl || !this.debugEnabledEl || !this.probeIntervalEl || !this.offlineThresholdEl) return;
+        this.initialize();
+    }
+
+    async initialize() {
+        await this.loadZombieAlertConfig();
+        await this.loadRadioDebugConfig();
+        await this.loadRadioProbeConfig();
+        await this.loadRadioOfflineAlertConfig();
+        this.setupEventHandlers();
+    }
+
+    setupEventHandlers() {
+        this.zombieSaveBtn.addEventListener('click', () => this.saveZombieAlert(false));
+        this.zombieSaveConfigBtn.addEventListener('click', () => this.saveZombieAlert(true));
+        this.debugSaveBtn.addEventListener('click', () => this.saveRadioDebug(false, false));
+        this.debugSaveConfigBtn.addEventListener('click', () => this.saveRadioDebug(true, false));
+        this.debugApplyBtn.addEventListener('click', () => this.saveRadioDebug(true, true));
+        this.probeSaveBtn.addEventListener('click', () => this.saveRadioProbe(false));
+        this.probeSaveConfigBtn.addEventListener('click', () => this.saveRadioProbe(true));
+        this.offlineSaveBtn.addEventListener('click', () => this.saveRadioOfflineAlert(false));
+        this.offlineSaveConfigBtn.addEventListener('click', () => this.saveRadioOfflineAlert(true));
+    }
+
+    async loadZombieAlertConfig() {
+        try {
+            const resp = await fetch('/api/config/zombie-alert');
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const data = await resp.json();
+            const metaEnabled = String(data?.meta?.alert_enabled || '').toLowerCase();
+            const iniEnabled = String(data?.config_ini?.alert_enabled || 'false').toLowerCase();
+            const effectiveEnabled = metaEnabled ? metaEnabled === 'true' : iniEnabled === 'true';
+            const effectiveEmail = data?.meta?.alert_email || data?.config_ini?.alert_email || '';
+            this.zombieEnabledEl.checked = effectiveEnabled;
+            this.zombieEmailEl.value = effectiveEmail;
+            const iniEmail = data?.config_ini?.alert_email || '(blank)';
+            this.zombieIniEl.textContent = `enabled=${iniEnabled}, email=${iniEmail}`;
+        } catch (err) {
+            this.showStatus(this.zombieStatusEl, `Failed to load zombie alert config: ${err.message}`, 'danger');
+        }
+    }
+
+    async loadRadioDebugConfig() {
+        try {
+            const resp = await fetch('/api/config/radio-debug');
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const data = await resp.json();
+            const metaEnabled = String(data?.meta?.enabled || '').toLowerCase();
+            const iniEnabled = String(data?.config_ini?.enabled || 'false').toLowerCase();
+            this.debugEnabledEl.checked = metaEnabled ? metaEnabled === 'true' : iniEnabled === 'true';
+            this.debugIniEl.textContent = `enabled=${iniEnabled}`;
+        } catch (err) {
+            this.showStatus(this.debugStatusEl, `Failed to load radio debug config: ${err.message}`, 'danger');
+        }
+    }
+
+    async saveZombieAlert(writeToConfig) {
+        this.setBusy([this.zombieSaveBtn, this.zombieSaveConfigBtn], true);
+        this.hideStatus(this.zombieStatusEl);
+        try {
+            const resp = await fetch('/api/config/zombie-alert', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest',
+                },
+                body: JSON.stringify({
+                    alert_enabled: this.zombieEnabledEl.checked ? 'true' : 'false',
+                    alert_email: this.zombieEmailEl.value.trim(),
+                    write_to_config: writeToConfig ? 'true' : 'false',
+                }),
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data.success) throw new Error(data.error || 'Save failed');
+            this.showStatus(
+                this.zombieStatusEl,
+                writeToConfig ? 'Saved to metadata and config.ini.' : 'Saved to metadata.',
+                'success',
+            );
+            await this.loadZombieAlertConfig();
+        } catch (err) {
+            this.showStatus(this.zombieStatusEl, `Save failed: ${err.message}`, 'danger');
+        } finally {
+            this.setBusy([this.zombieSaveBtn, this.zombieSaveConfigBtn], false);
+        }
+    }
+
+    async saveRadioDebug(writeToConfig, reconnect) {
+        this.setBusy([this.debugSaveBtn, this.debugSaveConfigBtn, this.debugApplyBtn], true);
+        this.hideStatus(this.debugStatusEl);
+        try {
+            const resp = await fetch('/api/config/radio-debug', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest',
+                },
+                body: JSON.stringify({
+                    enabled: this.debugEnabledEl.checked ? 'true' : 'false',
+                    write_to_config: writeToConfig ? 'true' : 'false',
+                    reconnect: reconnect ? 'true' : 'false',
+                }),
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data.success) throw new Error(data.error || 'Save failed');
+            const msg = reconnect
+                ? 'Saved and queued reconnect to apply now.'
+                : writeToConfig
+                    ? 'Saved to metadata and config.ini.'
+                    : 'Saved to metadata.';
+            this.showStatus(this.debugStatusEl, msg, 'success');
+            await this.loadRadioDebugConfig();
+        } catch (err) {
+            this.showStatus(this.debugStatusEl, `Save failed: ${err.message}`, 'danger');
+        } finally {
+            this.setBusy([this.debugSaveBtn, this.debugSaveConfigBtn, this.debugApplyBtn], false);
+        }
+    }
+
+    async loadRadioProbeConfig() {
+        try {
+            const resp = await fetch('/api/config/radio-probe');
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const data = await resp.json();
+            this.probeIntervalEl.value = data.probe_interval_seconds || 300;
+            this.probeFailThresholdEl.value = data.probe_fail_threshold || 3;
+            this.probeIniEl.textContent = `interval=${data.probe_interval_seconds || 300}s, threshold=${data.probe_fail_threshold || 3}`;
+        } catch (err) {
+            this.showStatus(this.probeStatusEl, `Failed to load radio probe config: ${err.message}`, 'danger');
+        }
+    }
+
+    async saveRadioProbe(writeToConfig) {
+        this.setBusy([this.probeSaveBtn, this.probeSaveConfigBtn], true);
+        this.hideStatus(this.probeStatusEl);
+        try {
+            const resp = await fetch('/api/config/radio-probe', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest',
+                },
+                body: JSON.stringify({
+                    probe_interval_seconds: parseInt(this.probeIntervalEl.value),
+                    probe_fail_threshold: parseInt(this.probeFailThresholdEl.value),
+                    save_to_config: writeToConfig,
+                }),
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data.success) throw new Error(data.error || 'Save failed');
+            this.showStatus(
+                this.probeStatusEl,
+                writeToConfig ? 'Saved to metadata and config.ini.' : 'Saved to metadata.',
+                'success',
+            );
+            await this.loadRadioProbeConfig();
+        } catch (err) {
+            this.showStatus(this.probeStatusEl, `Save failed: ${err.message}`, 'danger');
+        } finally {
+            this.setBusy([this.probeSaveBtn, this.probeSaveConfigBtn], false);
+        }
+    }
+
+    async loadRadioOfflineAlertConfig() {
+        try {
+            const resp = await fetch('/api/config/radio-offline-alert');
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const data = await resp.json();
+            this.offlineThresholdEl.value = data.offline_threshold || 3;
+            this.offlineAlertEnabledEl.checked = data.alert_enabled || false;
+            this.offlineAlertEmailEl.value = data.alert_email || '';
+            this.offlineIniEl.textContent = `threshold=${data.offline_threshold || 3}, enabled=${data.alert_enabled || false}, email=${data.alert_email || '(blank)'}`;
+        } catch (err) {
+            this.showStatus(this.offlineStatusEl, `Failed to load radio offline alert config: ${err.message}`, 'danger');
+        }
+    }
+
+    async saveRadioOfflineAlert(writeToConfig) {
+        this.setBusy([this.offlineSaveBtn, this.offlineSaveConfigBtn], true);
+        this.hideStatus(this.offlineStatusEl);
+        try {
+            const resp = await fetch('/api/config/radio-offline-alert', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest',
+                },
+                body: JSON.stringify({
+                    offline_threshold: parseInt(this.offlineThresholdEl.value),
+                    alert_enabled: this.offlineAlertEnabledEl.checked,
+                    alert_email: this.offlineAlertEmailEl.value.trim(),
+                    save_to_config: writeToConfig,
+                }),
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data.success) throw new Error(data.error || 'Save failed');
+            this.showStatus(
+                this.offlineStatusEl,
+                writeToConfig ? 'Saved to metadata and config.ini.' : 'Saved to metadata.',
+                'success',
+            );
+            await this.loadRadioOfflineAlertConfig();
+        } catch (err) {
+            this.showStatus(this.offlineStatusEl, `Save failed: ${err.message}`, 'danger');
+        } finally {
+            this.setBusy([this.offlineSaveBtn, this.offlineSaveConfigBtn], false);
+        }
+    }
+
+    setBusy(buttons, busy) {
+        buttons.forEach(btn => {
+            if (btn) btn.disabled = busy;
+        });
+    }
+
+    showStatus(el, msg, type) {
+        if (!el) return;
+        el.textContent = msg;
+        el.className = `small text-${type}`;
+        el.style.display = 'inline';
+        if (type === 'success') setTimeout(() => this.hideStatus(el), 4500);
+    }
+
+    hideStatus(el) {
+        if (!el) return;
+        el.style.display = 'none';
     }
 }
 
@@ -1123,6 +1407,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     new LogRotationManager();
     new DbBackupManager();
+    new RadioReliabilityManager();
     new MaintenanceStatusManager();
     new RestoreManager();
     new PurgeManager();

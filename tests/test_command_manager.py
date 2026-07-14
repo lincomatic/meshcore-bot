@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import pytest
 
 from modules.command_manager import CommandManager, InternetStatusCache
+from modules.models import MeshMessage
 from tests.conftest import mock_message
 
 
@@ -33,11 +34,14 @@ def cm_bot(mock_logger):
         side_effect=lambda key, **kw: f"{key}: {' '.join(str(v) for v in kw.values())}"
     )
     bot.meshcore = None
+    bot.is_radio_zombie = False
+    bot.is_radio_offline = False
     bot.rate_limiter = Mock()
     bot.rate_limiter.can_send = Mock(return_value=True)
     bot.bot_tx_rate_limiter = Mock()
     bot.bot_tx_rate_limiter.wait_for_tx = Mock()
     bot.tx_delay_ms = 0
+    bot.is_radio_zombie = False
     return bot
 
 
@@ -346,6 +350,131 @@ class TestSendChannelMessageListeners:
         assert received[0] == {"channel_idx": 3, "text": "TestBot: Hello mesh"}
 
     @pytest.mark.asyncio
+    async def test_send_channel_message_suppressed_when_radio_offline(self, cm_bot):
+        """Interactive channel sends should suppress while radio-offline is active."""
+        cm_bot.connected = True
+        cm_bot.is_radio_offline = True
+        cm_bot.meshcore = Mock()
+        cm_bot.channel_manager = Mock()
+        cm_bot.channel_manager.get_channel_number = Mock(return_value=3)
+        manager = make_manager(cm_bot)
+
+        result = await manager.send_channel_message("general", "Hello mesh")
+
+        assert result is False
+        cm_bot.channel_manager.get_channel_number.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_dm_suppressed_when_radio_offline(self, cm_bot):
+        """Interactive DM sends should suppress while radio-offline is active."""
+        cm_bot.connected = True
+        cm_bot.is_radio_offline = True
+        cm_bot.meshcore = Mock()
+        cm_bot.meshcore.get_contact_by_name = Mock(return_value={"name": "TestUser"})
+        manager = make_manager(cm_bot)
+
+        result = await manager.send_dm("TestUser", "Hello mesh")
+
+        assert result is False
+        cm_bot.meshcore.get_contact_by_name.assert_not_called()
+
+
+class TestSendDMRecipientResolution:
+    """Tests for recipient lookup in send_dm()."""
+
+    @pytest.mark.asyncio
+    async def test_send_dm_resolves_contact_by_pubkey_prefix(self, cm_bot):
+        """When name lookup fails, send_dm should resolve by public key prefix."""
+        from meshcore import EventType
+
+        cm_bot.connected = True
+        cm_bot.meshcore = Mock()
+        cm_bot.meshcore.get_contact_by_name = Mock(return_value=None)
+        cm_bot.meshcore.contacts = {
+            "contact1": {
+                "name": "Alice",
+                "adv_name": "AliceAdv",
+                "public_key": "ab12deadbeefcafebabe",
+            }
+        }
+        cm_bot.meshcore.commands = Mock(spec=["send_msg"])
+        cm_bot.meshcore.commands.send_msg = AsyncMock(return_value=Mock(type=EventType.MSG_SENT, payload=None))
+        cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
+        manager = make_manager(cm_bot)
+
+        result = await manager.send_dm("ab12", "Hello mesh")
+
+        assert result is True
+        cm_bot.meshcore.get_contact_by_name.assert_called_once_with("ab12")
+        cm_bot.meshcore.commands.send_msg.assert_awaited_once()
+        sent_contact = cm_bot.meshcore.commands.send_msg.await_args.args[0]
+        assert sent_contact["name"] == "Alice"
+        assert sent_contact["public_key"].startswith("ab12")
+
+    @pytest.mark.asyncio
+    async def test_send_dm_fails_when_name_and_prefix_lookup_miss(self, cm_bot):
+        """send_dm should fail when recipient cannot be resolved by name or prefix."""
+        cm_bot.connected = True
+        cm_bot.meshcore = Mock()
+        cm_bot.meshcore.get_contact_by_name = Mock(return_value=None)
+        cm_bot.meshcore.contacts = {
+            "contact1": {
+                "name": "Bob",
+                "public_key": "ffffdeadbeefcafebabe",
+            }
+        }
+        cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
+        manager = make_manager(cm_bot)
+
+        result = await manager.send_dm("ab12", "Hello mesh")
+
+        assert result is False
+        cm_bot.meshcore.get_contact_by_name.assert_called_once_with("ab12")
+        cm_bot.logger.error.assert_called()
+        assert "Contact not found for DM recipient identifier" in cm_bot.logger.error.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_send_response_dm_uses_sender_pubkey_over_name(self, cm_bot):
+        """send_response for a DM must use sender_pubkey (not sender_id/name) to avoid
+        misrouting when two nodes share a similar display name."""
+        from meshcore import EventType
+
+        cm_bot.connected = True
+        cm_bot.meshcore = Mock()
+        # Name lookup by display name would resolve the WRONG node (same name prefix)
+        cm_bot.meshcore.get_contact_by_name = Mock(return_value=None)
+        cm_bot.meshcore.contacts = {
+            "contact1": {
+                "name": "Alice",
+                "adv_name": "Alice",
+                "public_key": "aabbccddeeff001122",
+            },
+            "contact2": {
+                "name": "Alice-repeater",
+                "adv_name": "Alice-repeater",
+                "public_key": "ffeeddccbbaa998877",
+            },
+        }
+        cm_bot.meshcore.commands = Mock(spec=["send_msg"])
+        cm_bot.meshcore.commands.send_msg = AsyncMock(return_value=Mock(type=EventType.MSG_SENT, payload=None))
+        cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
+        manager = make_manager(cm_bot)
+
+        msg = MeshMessage(
+            content="hello",
+            sender_id="Alice",
+            sender_pubkey="aabbccddeeff001122",
+            is_dm=True,
+        )
+
+        result = await manager.send_response(msg, "Hi back")
+
+        assert result is True
+        cm_bot.meshcore.get_contact_by_name.assert_called_once_with("aabbccddeeff001122")
+        sent_contact = cm_bot.meshcore.commands.send_msg.await_args.args[0]
+        assert sent_contact["public_key"] == "aabbccddeeff001122"
+
+    @pytest.mark.asyncio
     async def test_failed_send_does_not_invoke_listeners(self, cm_bot):
         """When send_channel_message fails (e.g. channel not found), listeners are not called."""
         cm_bot.connected = True
@@ -550,6 +679,7 @@ class TestSendChannelMessageRetry:
 
     def _setup_bot(self, cm_bot):
         cm_bot.connected = True
+        cm_bot.is_radio_zombie = False
         cm_bot.channel_manager = Mock()
         cm_bot.channel_manager.get_channel_number = Mock(return_value=2)
         cm_bot.meshcore = Mock()
@@ -728,39 +858,52 @@ class TestGetMaxMessageLength:
 
     def test_dm_returns_158_bytes(self):
         mgr = self._make_manager()
-        msg = Mock()
-        msg.is_dm = True
+        msg = MeshMessage(content="x", is_dm=True)
         assert mgr.get_max_message_length(msg) == 158
 
     def test_channel_uses_bot_name_utf8_bytes(self):
         mgr = self._make_manager(bot_name="LongBotName")
-        msg = Mock()
-        msg.is_dm = False
+        msg = MeshMessage(content="x", channel="general", is_dm=False)
         # 160 - utf8("LongBotName") - 2 = 160 - 11 - 2 = 147
         assert mgr.get_max_message_length(msg) == 147
 
     def test_channel_uses_meshcore_username_utf8_bytes(self):
         mgr = self._make_manager(bot_name="fallback", username="Radio")
-        msg = Mock()
-        msg.is_dm = False
+        msg = MeshMessage(content="x", channel="general", is_dm=False)
         # 160 - utf8("Radio") - 2 = 160 - 5 - 2 = 153
         assert mgr.get_max_message_length(msg) == 153
+
+    def test_channel_regional_reply_scope_reduces_budget_by_10_bytes(self):
+        mgr = self._make_manager(bot_name="LongBotName")
+        msg = MeshMessage(content="x", channel="general", is_dm=False, reply_scope="#west")
+        assert mgr.get_max_message_length(msg) == 137  # 147 - 10
+
+    def test_channel_outgoing_flood_scope_override_reduces_budget_by_10_bytes(self):
+        mgr = self._make_manager(bot_name="LongBotName")
+        mgr.bot.config.set("Channels", "outgoing_flood_scope_override", "#west")
+        msg = MeshMessage(content="x", channel="general", is_dm=False)
+        assert mgr.get_max_message_length(msg) == 137
 
     def test_parity_with_base_command_get_max_message_length(self):
         """CommandManager must mirror BaseCommand byte budgets (PR #128)."""
         from tests.commands.test_base_command import _TestCommand
 
-        cases: list[tuple[str, str | None, bool]] = [
-            ("LongBotName", None, False),
-            ("Bot", None, True),
-            ("fallback", "Radio", False),
-            ("x", "😀😀", False),
+        cases: list[tuple[str, str | None, bool, str | None]] = [
+            ("LongBotName", None, False, None),
+            ("Bot", None, True, None),
+            ("fallback", "Radio", False, None),
+            ("x", "😀😀", False, None),
+            ("LongBotName", None, False, "#west"),
         ]
-        for bot_name, username, is_dm in cases:
+        for bot_name, username, is_dm, reply_scope in cases:
             mgr = self._make_manager(bot_name=bot_name, username=username)
             cmd = _TestCommand(mgr.bot)
-            msg = Mock()
-            msg.is_dm = is_dm
+            msg = MeshMessage(
+                content="x",
+                channel=None if is_dm else "general",
+                is_dm=is_dm,
+                reply_scope=reply_scope,
+            )
             m_len = mgr.get_max_message_length(msg)
             b_len = cmd.get_max_message_length(msg)
-            assert m_len == b_len, (bot_name, username, is_dm, m_len, b_len)
+            assert m_len == b_len, (bot_name, username, is_dm, reply_scope, m_len, b_len)
