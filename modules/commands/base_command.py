@@ -1042,7 +1042,7 @@ class BaseCommand(ABC):
             path_nodes = routing_info.get('path_nodes', [])
             if path_nodes:
                 path_str = ','.join(str(n).lower() for n in path_nodes)
-                return f"{path_str} ({len(path_nodes)} hops)"
+                return f"{path_str}|({len(path_nodes)} hops)"
         if not message.path:
             return "Unknown"
         path_string = message.path
