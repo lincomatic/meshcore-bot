@@ -24,7 +24,7 @@ class Magic8Command(BaseCommand):
 
     # Plugin metadata
     name = "magic8"
-    keywords = ['magic8']
+    keywords = ['magic8','8ball']
     description = "Emulates the classic Magic 8-ball toy'"
     category = "games"
 
